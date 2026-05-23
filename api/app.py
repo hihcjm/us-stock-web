@@ -4,6 +4,8 @@ import pandas as pd
 import math
 import re
 import os
+import requests
+from bs4 import BeautifulSoup
 
 template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'templates')
 app = Flask(__name__, template_folder=template_dir)
@@ -205,6 +207,164 @@ def parse_annual_history(data):
         'price':     price,
     }
 
+# ── 3-a. Stockanalysis 장기 컨센서스 스크래핑 ────────────────────
+def get_stockanalysis_estimates(ticker):
+    """
+    stockanalysis.com/stocks/{ticker}/forecast/ 에서
+    FY2026~2027 EPS·Revenue 컨센서스(avg/high/low)와 목표주가 수집.
+    반환 예:
+    {
+      'eps': {'FY2026': {'avg':8.94,'high':9.46,'low':8.36,'n_analysts':50}, ...},
+      'rev': {'FY2026': {'avg':486.8,'high':509.5,'low':445.8}, ...},
+      'target': {'low':215,'avg':308.07,'median':310,'high':400},
+      'fwd_pe': {'FY2026': 34.53, 'FY2027': 31.31},
+    }
+    실패 시 None 반환.
+    """
+    try:
+        url = f'https://stockanalysis.com/stocks/{ticker.lower()}/forecast/'
+        hdrs = {
+            'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                           'AppleWebKit/537.36 (KHTML, like Gecko) '
+                           'Chrome/124.0.0.0 Safari/537.36'),
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+        resp = requests.get(url, headers=hdrs, timeout=12)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        tables = soup.find_all('table')
+        if len(tables) < 4:
+            return None
+
+        def parse_val(s):
+            """'486.8B' → 486.8, '8.94' → 8.94, 'Upgrade'/'Pro' → None"""
+            s = s.strip()
+            if not s or s in ('Upgrade', 'Pro', '-', 'N/A', ''):
+                return None
+            s = s.replace(',', '')
+            mul = 1
+            if s.endswith('T'):
+                mul = 1e3; s = s[:-1]
+            elif s.endswith('B'):
+                mul = 1; s = s[:-1]
+            elif s.endswith('M'):
+                mul = 1e-3; s = s[:-1]
+            try:
+                return round(float(s) * mul, 2)
+            except:
+                return None
+
+        result = {'eps': {}, 'rev': {}, 'target': {}, 'fwd_pe': {}}
+
+        # ── table[0]: 목표주가 ──
+        t0 = tables[0]
+        rows_t0 = t0.find_all('tr')
+        if len(rows_t0) >= 2:
+            hdrs_t0 = [th.get_text(strip=True) for th in rows_t0[0].find_all(['th','td'])]
+            vals_t0 = [td.get_text(strip=True) for td in rows_t0[1].find_all(['th','td'])]
+            tgt_map = {'Low':'low','Average':'avg','Median':'median','High':'high'}
+            for h, v in zip(hdrs_t0, vals_t0):
+                k = tgt_map.get(h)
+                if k:
+                    pv = parse_val(v.replace('$','').replace('%','').strip())
+                    if pv: result['target'][k] = pv
+
+        # ── table[3]: 연간 종합 (EPS·Revenue·Forward PE·애널리스트 수) ──
+        t3 = tables[3]
+        rows_t3 = t3.find_all('tr')
+        if rows_t3:
+            year_hdrs = [td.get_text(strip=True) for td in rows_t3[0].find_all(['th','td'])]
+            row_map = {}
+            for row in rows_t3[1:]:
+                cells = [td.get_text(strip=True) for td in row.find_all(['th','td'])]
+                if cells:
+                    row_map[cells[0]] = cells[1:]
+
+            for col_i, yr_label in enumerate(year_hdrs[1:], 0):
+                # FY2026, FY2027 만 처리
+                m = re.search(r'(\d{4})', yr_label)
+                if not m:
+                    continue
+                yr_int = int(m.group(1))
+                if yr_int < 2025:
+                    continue
+                fy_key = f'FY{yr_int}'
+
+                eps_val  = parse_val(row_map.get('EPS', [''] * 20)[col_i]) if 'EPS' in row_map else None
+                rev_val  = parse_val(row_map.get('Revenue', [''] * 20)[col_i]) if 'Revenue' in row_map else None
+                fpe_val  = parse_val(row_map.get('Forward PE', [''] * 20)[col_i]) if 'Forward PE' in row_map else None
+                n_str    = row_map.get('No. Analysts', [''] * 20)[col_i] if 'No. Analysts' in row_map else ''
+                try:
+                    n_val = int(n_str) if n_str and n_str not in ('Upgrade','Pro','-') else None
+                except:
+                    n_val = None
+
+                if eps_val:
+                    if fy_key not in result['eps']:
+                        result['eps'][fy_key] = {}
+                    result['eps'][fy_key]['avg'] = eps_val
+                    if n_val:
+                        result['eps'][fy_key]['n_analysts'] = n_val
+                if rev_val:
+                    if fy_key not in result['rev']:
+                        result['rev'][fy_key] = {}
+                    result['rev'][fy_key]['avg'] = rev_val
+                if fpe_val:
+                    result['fwd_pe'][fy_key] = fpe_val
+
+        # ── table[4]: Revenue 상세(high/avg/low) ──
+        if len(tables) > 4:
+            t4 = tables[4]
+            rows_t4 = t4.find_all('tr')
+            if rows_t4:
+                yr_hdrs4 = [td.get_text(strip=True) for td in rows_t4[0].find_all(['th','td'])]
+                for row in rows_t4[1:]:
+                    cells = [td.get_text(strip=True) for td in row.find_all(['th','td'])]
+                    if not cells: continue
+                    kind = cells[0].strip().lower()  # 'high','avg','low'
+                    if kind not in ('high','avg','low'): continue
+                    for col_i, yr_label in enumerate(yr_hdrs4[1:], 0):
+                        m = re.search(r'(\d{4})', yr_label)
+                        if not m: continue
+                        yr_int = int(m.group(1))
+                        if yr_int < 2025: continue
+                        fy_key = f'FY{yr_int}'
+                        v = parse_val(cells[col_i + 1]) if col_i + 1 < len(cells) else None
+                        if v:
+                            if fy_key not in result['rev']:
+                                result['rev'][fy_key] = {}
+                            result['rev'][fy_key][kind] = v
+
+        # ── table[6]: EPS 상세(high/avg/low) ──
+        if len(tables) > 6:
+            t6 = tables[6]
+            rows_t6 = t6.find_all('tr')
+            if rows_t6:
+                yr_hdrs6 = [td.get_text(strip=True) for td in rows_t6[0].find_all(['th','td'])]
+                for row in rows_t6[1:]:
+                    cells = [td.get_text(strip=True) for td in row.find_all(['th','td'])]
+                    if not cells: continue
+                    kind = cells[0].strip().lower()
+                    if kind not in ('high','avg','low'): continue
+                    for col_i, yr_label in enumerate(yr_hdrs6[1:], 0):
+                        m = re.search(r'(\d{4})', yr_label)
+                        if not m: continue
+                        yr_int = int(m.group(1))
+                        if yr_int < 2025: continue
+                        fy_key = f'FY{yr_int}'
+                        v = parse_val(cells[col_i + 1]) if col_i + 1 < len(cells) else None
+                        if v:
+                            if fy_key not in result['eps']:
+                                result['eps'][fy_key] = {}
+                            result['eps'][fy_key][kind] = v
+
+        return result if (result['eps'] or result['rev']) else None
+
+    except Exception:
+        return None
+
+
 # ── 3. 컨센서스 추정치 ────────────────────────────────────────────
 def get_estimates(data):
     """
@@ -312,6 +472,9 @@ def get_estimates(data):
 
     # 발행주식수 (주 단위 → calc_dcf에서 B주로 변환)
     result['shares_outstanding'] = safe_float(info.get('sharesOutstanding'))
+
+    # Stockanalysis 장기 컨센서스 (FY2026~2027)
+    result['sa'] = get_stockanalysis_estimates(data['ticker'])
 
     return result
 
@@ -465,14 +628,26 @@ def calc_dcf(hist_annual, estimates, r=None):
 
         avg_margin = sum(hist_margins) / len(hist_margins)
 
-        # ── 매출 성장률 ──
-        # 우선순위: ① 컨센서스 CY→+1Y 성장률 ② 과거 CAGR+마지막1년 평균 (상한 30%)
+        # ── Stockanalysis 장기 컨센서스 ──
+        sa = est.get('sa') or {}
+        sa_rev = sa.get('rev', {})   # {'FY2026': {'avg':486.8,'high':509.5,'low':445.8}, ...}
+        sa_eps = sa.get('eps', {})
+
+        # ── 매출 성장률 (SA → yfinance → CAGR 순 우선순위) ──
         rev_list = [v for v in rows['Revenue'] if v and v > 0]
         curr_rev = est.get('curr_yr_rev')
         next_rev = est.get('next_yr_rev')
 
-        if curr_rev and next_rev and curr_rev > 0:
-            # 컨센서스 기반 성장률 사용
+        # SA에서 가장 가까운 두 연도로 성장률 산출
+        sa_rev_avgs = sorted(
+            [(yr, d['avg']) for yr, d in sa_rev.items() if d.get('avg')],
+            key=lambda x: x[0]
+        )
+        if len(sa_rev_avgs) >= 2:
+            r0, r1 = sa_rev_avgs[0][1], sa_rev_avgs[-1][1]
+            n_yrs  = len(sa_rev_avgs) - 1
+            rev_growth = min((r1 / r0) ** (1 / n_yrs) - 1, 0.30)
+        elif curr_rev and next_rev and curr_rev > 0:
             rev_growth = min((next_rev / curr_rev) - 1, 0.30)
         elif len(rev_list) >= 2:
             cagr   = (rev_list[-1] / rev_list[0]) ** (1 / (len(rev_list) - 1)) - 1
@@ -507,28 +682,51 @@ def calc_dcf(hist_annual, estimates, r=None):
         if not shares_b:
             shares_b = 1.0
 
-        fcf_years = []
+        # ── 3개년 프로젝션 구성 ──
+        # SA 연도 순서: FY2025, FY2026, FY2027 ... 중 현재연도 이후만 사용
+        import datetime
+        current_fy_year = datetime.date.today().year  # 현재 캘린더 연도 기준
 
-        # FY+1 (현재 컨센서스 연도)
-        label1 = f"FY+1 (Est)"
-        rev1   = base_rev
-        fcf1   = rev1 * avg_margin if rev1 else None
-        if fcf1:
-            fcf_years.append((label1, fcf1, rev1))
+        # SA rev 데이터에서 사용 가능한 연도(현재년도 이상) 추출
+        sa_proj_years = sorted([
+            (yr, d) for yr, d in sa_rev.items()
+            if d.get('avg') and int(yr.replace('FY','')) >= current_fy_year
+        ], key=lambda x: x[0])
 
-        # FY+2
-        label2 = f"FY+2 (Est)"
-        rev2   = next_rev or (base_rev * (1 + rev_growth) if base_rev else None)
-        fcf2   = rev2 * avg_margin if rev2 else None
-        if fcf2:
-            fcf_years.append((label2, fcf2, rev2))
+        fcf_years = []  # [(label, fcf_val, rev_val, rev_src, rev_range)]
 
-        # FY+3
-        label3 = f"FY+3 (Est)"
-        rev3   = (rev2 * (1 + rev_growth)) if rev2 else None
-        fcf3   = rev3 * avg_margin if rev3 else None
-        if fcf3:
-            fcf_years.append((label3, fcf3, rev3))
+        if sa_proj_years:
+            # SA 데이터로 최대 3개년 채우기
+            for i, (fy_key, rev_d) in enumerate(sa_proj_years[:3]):
+                yr_int  = int(fy_key.replace('FY',''))
+                rev_val = rev_d['avg']
+                rev_hi  = rev_d.get('high')
+                rev_lo  = rev_d.get('low')
+                fcf_val = rev_val * avg_margin
+                label   = f"{fy_key} (컨센서스)"
+                rev_rng = f"${rev_lo}B–${rev_hi}B" if rev_lo and rev_hi else None
+                fcf_years.append((label, fcf_val, rev_val, 'Stockanalysis', rev_rng))
+
+            # SA가 3개 미만이면 성장률로 연장
+            last_rev = fcf_years[-1][2]
+            while len(fcf_years) < 3:
+                last_label = fcf_years[-1][0]
+                m = re.search(r'(\d{4})', last_label)
+                next_yr = int(m.group(1)) + 1 if m else current_fy_year + len(fcf_years)
+                rev_ext = last_rev * (1 + rev_growth)
+                fcf_ext = rev_ext * avg_margin
+                fcf_years.append((f"FY{next_yr} (추정)", fcf_ext, rev_ext, '성장률 연장', None))
+                last_rev = rev_ext
+        else:
+            # SA 없으면 기존 yfinance 방식
+            rev1 = base_rev
+            if rev1:
+                fcf_years.append(("FY+1 (추정)", rev1 * avg_margin, rev1, 'yfinance', None))
+            rev2 = next_rev or (base_rev * (1 + rev_growth) if base_rev else None)
+            if rev2:
+                fcf_years.append(("FY+2 (추정)", rev2 * avg_margin, rev2, 'yfinance', None))
+                rev3 = rev2 * (1 + rev_growth)
+                fcf_years.append(("FY+3 (추정)", rev3 * avg_margin, rev3, '성장률 연장', None))
 
         if not fcf_years:
             return {"error": "Cannot project FCF"}
@@ -536,7 +734,7 @@ def calc_dcf(hist_annual, estimates, r=None):
         # ── 할인 계산 ──
         pv_fcfs  = []
         cum_pv   = 0
-        for t_idx, (label, fcf_e, rev_e) in enumerate(fcf_years):
+        for t_idx, (label, fcf_e, rev_e, rev_src, rev_rng) in enumerate(fcf_years):
             n       = t_idx + 1
             pv      = fcf_e / (1 + r) ** n
             cum_pv += pv
@@ -549,6 +747,9 @@ def calc_dcf(hist_annual, estimates, r=None):
             diff_p  = f"{(fv - price)/price*100:+.1f}" if fv and price else None
             pv_fcfs.append({
                 "year":       label,
+                "rev":        round(rev_e, 2),
+                "rev_src":    rev_src,
+                "rev_rng":    rev_rng,
                 "fcf":        round(fcf_e, 2),     # B달러
                 "pv":         round(pv, 2),
                 "pv_tv":      round(pv_tv, 2),
@@ -656,6 +857,7 @@ def analyze_us_stock(ticker_symbol):
             "de_ratio":  est.get('de_ratio'),
             "raw_table": fin_tbl,
             "est":       est,
+            "sa":        est.get('sa'),
             "dcf":       dcf,
             "band":      band,
         }

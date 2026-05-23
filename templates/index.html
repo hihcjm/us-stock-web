@@ -467,6 +467,81 @@
   </div>
   {% endif %}
 
+  {# ── Stockanalysis 장기 컨센서스 ── #}
+  {% if result.sa and (result.sa.eps or result.sa.rev) %}
+  <div class="card">
+    <div class="card-header">📅 장기 컨센서스 추정치 <span style="font-size:11px;font-weight:400;color:#718096;margin-left:6px;">출처: Stockanalysis.com</span></div>
+    <div style="padding:14px 20px; overflow-x:auto;">
+      <table class="est-table" style="font-size:13px;">
+        <thead>
+          <tr>
+            <th>항목</th>
+            {% set sa_years = (result.sa.eps.keys() | list + result.sa.rev.keys() | list) | unique | sort %}
+            {% for yr in sa_years %}<th>{{ yr }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {# EPS 추정 #}
+          {% if result.sa.eps %}
+          <tr>
+            <td style="color:#4a5568;font-weight:600;">EPS 추정 ($)</td>
+            {% for yr in sa_years %}
+              {% set d = result.sa.eps.get(yr, {}) %}
+              <td>
+                {% if d.avg %}
+                  <strong>{{ d.avg }}</strong>
+                  {% if d.low and d.high %}
+                  <span style="font-size:10px;color:#a0aec0;display:block;">{{ d.low }}–{{ d.high }}</span>
+                  {% endif %}
+                  {% if d.n_analysts %}
+                  <span style="font-size:10px;color:#a0aec0;">{{ d.n_analysts }}명</span>
+                  {% endif %}
+                {% else %}-{% endif %}
+              </td>
+            {% endfor %}
+          </tr>
+          {% endif %}
+          {# 매출 추정 #}
+          {% if result.sa.rev %}
+          <tr>
+            <td style="color:#4a5568;font-weight:600;">매출 추정 (B$)</td>
+            {% for yr in sa_years %}
+              {% set d = result.sa.rev.get(yr, {}) %}
+              <td>
+                {% if d.avg %}
+                  <strong>{{ d.avg }}B</strong>
+                  {% if d.low and d.high %}
+                  <span style="font-size:10px;color:#a0aec0;display:block;">{{ d.low }}B–{{ d.high }}B</span>
+                  {% endif %}
+                {% else %}-{% endif %}
+              </td>
+            {% endfor %}
+          </tr>
+          {% endif %}
+          {# Forward PE #}
+          {% if result.sa.fwd_pe %}
+          <tr>
+            <td style="color:#4a5568;font-weight:600;">Forward PER</td>
+            {% for yr in sa_years %}
+              <td>{{ result.sa.fwd_pe.get(yr, '-') }}</td>
+            {% endfor %}
+          </tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+    {% if result.sa.target %}
+    <div style="padding:0 20px 14px; display:flex; gap:20px; flex-wrap:wrap; font-size:13px;">
+      <span style="color:#718096;">목표주가</span>
+      {% if result.sa.target.low %}<span>최저 <strong style="color:#e53e3e;">${{ result.sa.target.low }}</strong></span>{% endif %}
+      {% if result.sa.target.avg %}<span>평균 <strong style="color:#2b6cb0;">${{ result.sa.target.avg }}</strong></span>{% endif %}
+      {% if result.sa.target.median %}<span>중앙값 <strong>${{ result.sa.target.median }}</strong></span>{% endif %}
+      {% if result.sa.target.high %}<span>최고 <strong style="color:#38a169;">${{ result.sa.target.high }}</strong></span>{% endif %}
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
   {# ── 재무제표 히스토리 ── #}
   <div class="card">
     <div class="card-header">📋 연간 재무제표 (Yahoo Finance)</div>
@@ -590,6 +665,16 @@
           </tr>
         </thead>
         <tbody>
+          <tr style="background:#f7fafc;">
+            <td style="color:#718096;">추정 매출 (B$)</td>
+            {% for row in result.dcf.pv_fcfs %}
+            <td style="color:#718096;">
+              ${{ row.rev }}B
+              {% if row.rev_rng %}<span style="font-size:10px;display:block;color:#a0aec0;">{{ row.rev_rng }}</span>{% endif %}
+              <span style="font-size:10px;display:block;color:#a0aec0;">{{ row.rev_src }}</span>
+            </td>
+            {% endfor %}
+          </tr>
           <tr>
             <td>추정 FCF (B$)</td>
             {% for row in result.dcf.pv_fcfs %}<td>${{ row.fcf }}</td>{% endfor %}
