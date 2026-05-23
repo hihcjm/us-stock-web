@@ -328,19 +328,21 @@ class DamodaranDCF:
         """
         roic    = roic_override if roic_override is not None else self._base_roic()
         rr_base = self._base_reinvestment_rate()
-        g_roic  = roic * rr_base   # pure implied growth
+        g_roic  = roic * max(rr_base, 0.0)
 
         if g_override is not None:
-            g_base = g_override
+            g_base = float(g_override)
         elif rev_cagr is not None and rev_cagr > 0:
-            # Blend historical CAGR with implied growth (weight CAGR more)
-            g_base = rev_cagr * 0.6 + g_roic * 0.4
+            # Use rev_cagr directly, capped so RR = g/ROIC stays ≤ 90%
+            g_max_by_roic = roic * 0.90
+            g_base = min(rev_cagr, g_max_by_roic)
+            g_base = max(g_base, g_roic)
         else:
             g_base = g_roic
 
-        # Floor: at least half of WACC when RR is near zero (CapEx ≈ DA)
-        g_floor = self.wacc * 0.5
-        if g_base < g_floor and rev_cagr is None and g_override is None:
+        # Floor: at minimum rf*1.5 or WACC*0.4 (growth firm baseline)
+        g_floor = max(self.rf * 1.5, self.wacc * 0.4)
+        if g_base < g_floor and g_override is None:
             g_base = g_floor
 
         g_base = min(g_base, 0.40)
