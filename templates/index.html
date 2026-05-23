@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>US Stock Valuation{% if result and not result.error %} — {{ result.ticker }}{% endif %}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #f0f4f8;
+    color: #1a202c;
+    min-height: 100vh;
+  }
+
+  /* ── 헤더 ── */
+  .site-header {
+    background: linear-gradient(135deg, #1a365d 0%, #2b6cb0 100%);
+    color: #fff;
+    padding: 20px 32px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  .site-header h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
+  .site-header p  { font-size: 13px; opacity: 0.75; margin-top: 2px; }
+
+  /* ── 검색 폼 ── */
+  .search-wrap {
+    background: #fff;
+    border-bottom: 1px solid #e2e8f0;
+    padding: 16px 32px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .search-wrap input {
+    width: 180px;
+    padding: 9px 14px;
+    border: 1px solid #cbd5e0;
+    border-radius: 6px;
+    font-size: 15px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    outline: none;
+    transition: border-color .2s;
+  }
+  .search-wrap input:focus { border-color: #3182ce; }
+  .search-wrap input::placeholder { text-transform: none; letter-spacing: 0; color: #a0aec0; }
+  .search-wrap button {
+    padding: 9px 22px;
+    background: #3182ce;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background .2s;
+  }
+  .search-wrap button:hover { background: #2b6cb0; }
+  .search-wrap .hint { font-size: 12px; color: #718096; }
+
+  /* ── 공통 카드 ── */
+  .card {
+    background: #fff;
+    border-radius: 10px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.08);
+    margin: 16px 32px;
+    overflow: hidden;
+  }
+  .card-header {
+    background: #ebf4ff;
+    padding: 12px 20px;
+    font-size: 14px;
+    font-weight: 700;
+    color: #2b6cb0;
+    border-bottom: 1px solid #bee3f8;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .card-body { padding: 16px 20px; }
+
+  /* ── 종목 헤더 요약 ── */
+  .stock-hero {
+    background: #fff;
+    margin: 16px 32px 0;
+    border-radius: 10px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.08);
+    padding: 20px 24px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 24px;
+    align-items: flex-start;
+  }
+  .stock-hero .name-block h2 { font-size: 22px; font-weight: 800; }
+  .stock-hero .name-block .ticker-badge {
+    display: inline-block;
+    background: #ebf4ff;
+    color: #2b6cb0;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 4px;
+    margin-left: 8px;
+  }
+  .stock-hero .name-block .sector { font-size: 12px; color: #718096; margin-top: 4px; }
+  .stock-hero .price-block { text-align: right; }
+  .stock-hero .price-block .price { font-size: 28px; font-weight: 800; color: #1a365d; }
+  .stock-hero .price-block .w52 { font-size: 12px; color: #718096; margin-top: 4px; }
+
+  /* ── KPI 그리드 ── */
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 12px;
+    padding: 16px 20px;
+  }
+  .kpi-item { text-align: center; }
+  .kpi-item .kpi-label { font-size: 11px; color: #718096; font-weight: 600; text-transform: uppercase; }
+  .kpi-item .kpi-val   { font-size: 18px; font-weight: 700; color: #2d3748; margin-top: 2px; }
+  .kpi-item .kpi-sub   { font-size: 11px; color: #a0aec0; margin-top: 1px; }
+
+  /* ── 애널리스트 섹션 ── */
+  .analyst-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    padding: 0 20px 16px;
+  }
+  .analyst-box {
+    background: #f7fafc;
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .analyst-box h4 { font-size: 12px; color: #718096; font-weight: 700; text-transform: uppercase; margin-bottom: 8px; }
+  .tp-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+  .tp-row .label  { font-size: 12px; color: #718096; }
+  .tp-row .value  { font-size: 14px; font-weight: 700; }
+  .tp-row .value.up   { color: #38a169; }
+  .tp-row .value.down { color: #e53e3e; }
+  .rec-badge {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 13px;
+    font-weight: 700;
+  }
+  .rec-buy         { background: #c6f6d5; color: #276749; }
+  .rec-hold        { background: #fefcbf; color: #744210; }
+  .rec-sell        { background: #fed7d7; color: #9b2335; }
+
+  /* ── 추정치 테이블 ── */
+  .est-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .est-table th { background: #f7fafc; padding: 8px 12px; text-align: left;
+                  border-bottom: 2px solid #e2e8f0; color: #4a5568; font-weight: 700; }
+  .est-table td { padding: 7px 12px; border-bottom: 1px solid #edf2f7; }
+  .est-table tr:last-child td { border-bottom: none; }
+  .tag-curr { background: #ebf4ff; color: #2b6cb0; font-size: 10px;
+              font-weight: 700; padding: 1px 5px; border-radius: 3px; }
+  .tag-next { background: #e6fffa; color: #276749; font-size: 10px;
+              font-weight: 700; padding: 1px 5px; border-radius: 3px; }
+
+  /* ── 재무 테이블 ── */
+  .financial-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .financial-table th {
+    background: #edf2f7; padding: 8px 12px;
+    text-align: right; font-weight: 700; color: #4a5568;
+    border-bottom: 2px solid #e2e8f0;
+    white-space: nowrap;
+  }
+  .financial-table th:first-child { text-align: left; }
+  .financial-table td {
+    padding: 6px 12px; border-bottom: 1px solid #edf2f7;
+    text-align: right; white-space: nowrap;
+  }
+  .financial-table td:first-child { text-align: left; color: #4a5568; font-weight: 500; }
+  .financial-table tr:hover td { background: #f7fafc; }
+  .financial-table tr:last-child td { border-bottom: none; }
+
+  /* ── 밴드 ── */
+  .band-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 16px;
+    padding: 16px 20px;
+  }
+  .band-card {
+    background: #f7fafc;
+    border-radius: 8px;
+    padding: 14px 16px;
+    border: 1px solid #e2e8f0;
+  }
+  .band-card h3 { font-size: 14px; font-weight: 700; color: #2d3748; margin-bottom: 10px; }
+  .band-row { display: flex; justify-content: space-between; font-size: 12px;
+              padding: 3px 0; border-bottom: 1px solid #edf2f7; }
+  .band-row:last-child { border-bottom: none; }
+  .band-row .bk  { color: #718096; }
+  .band-row .bv  { font-weight: 600; }
+  .band-bar-wrap { margin: 10px 0; position: relative; height: 6px;
+                   background: linear-gradient(to right, #bee3f8, #3182ce, #e53e3e);
+                   border-radius: 3px; }
+  .band-marker { position: absolute; top: -4px; width: 14px; height: 14px;
+                 background: #fff; border: 2px solid #2d3748;
+                 border-radius: 50%; transform: translateX(-50%); }
+  .grade-chip {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 700; margin-top: 4px;
+  }
+  .grade-Undervalued, .grade-Significantly-Undervalued { background:#c6f6d5; color:#276749; }
+  .grade-Fair        { background:#fefcbf; color:#744210; }
+  .grade-Overvalued, .grade-Significantly-Overvalued  { background:#fed7d7; color:#9b2335; }
+  .theory-row { font-size: 12px; margin-top: 6px; color: #4a5568; }
+  .theory-row .up   { color: #38a169; font-weight: 700; }
+  .theory-row .down { color: #e53e3e; font-weight: 700; }
+
+  /* ── DCF ── */
+  .val-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .val-table th {
+    background: #ebf4ff; padding: 8px 14px;
+    text-align: right; font-weight: 700; color: #2b6cb0;
+    border-bottom: 2px solid #bee3f8; white-space: nowrap;
+  }
+  .val-table th:first-child { text-align: left; }
+  .val-table td {
+    padding: 7px 14px; border-bottom: 1px solid #edf2f7;
+    text-align: right; white-space: nowrap;
+  }
+  .val-table td:first-child { text-align: left; font-weight: 500; color: #4a5568; }
+  .val-table tr:last-child td { border-bottom: none; }
+  .val-table .fair-val { font-size: 16px; font-weight: 800; color: #2b6cb0; }
+  .diff-up   { color: #38a169; font-weight: 700; }
+  .diff-down { color: #e53e3e; font-weight: 700; }
+
+  /* ── FCF 히스토리 테이블 ── */
+  .fcf-hist-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .fcf-hist-table th { background: #f0f4f8; padding: 6px 12px; border-bottom: 2px solid #e2e8f0;
+                       text-align: right; color: #4a5568; font-weight: 700; }
+  .fcf-hist-table th:first-child { text-align: left; }
+  .fcf-hist-table td { padding: 5px 12px; border-bottom: 1px solid #edf2f7; text-align: right; }
+  .fcf-hist-table td:first-child { text-align: left; }
+  .neg { color: #e53e3e; }
+  .excluded-row { opacity: 0.45; }
+
+  /* ── 에러 ── */
+  .error-box {
+    background: #fff5f5; border: 1px solid #feb2b2; color: #c53030;
+    border-radius: 8px; padding: 16px 20px; margin: 20px 32px;
+    font-size: 14px;
+  }
+
+  /* ── 반응형 ── */
+  @media (max-width: 700px) {
+    .card, .stock-hero, .error-box { margin: 12px 12px; }
+    .search-wrap { padding: 12px 16px; flex-wrap: wrap; }
+    .analyst-grid { grid-template-columns: 1fr; }
+    .kpi-grid { grid-template-columns: repeat(3, 1fr); }
+    .site-header { padding: 16px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="site-header">
+  <div>
+    <h1>🇺🇸 US Stock Valuation</h1>
+    <p>DCF · Relative Valuation · Analyst Consensus · Yahoo Finance Data</p>
+  </div>
+</header>
+
+<div class="search-wrap">
+  <form method="POST" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+    <input type="text" name="ticker" value="{{ ticker }}"
+           placeholder="e.g. AAPL, NVDA, MSFT" autocomplete="off" autofocus>
+    <button type="submit">Analyze</button>
+    <span class="hint">Enter a US stock ticker symbol</span>
+  </form>
+</div>
+
+{% if result %}
+  {% if result.error %}
+  <div class="error-box">⚠️ {{ result.error }}</div>
+  {% else %}
+
+  {# ── 종목 헤더 ── #}
+  <div class="stock-hero">
+    <div class="name-block" style="flex:1;">
+      <h2>{{ result.name }}<span class="ticker-badge">{{ result.ticker }}</span></h2>
+      <div class="sector">{{ result.sector }}{% if result.industry %} · {{ result.industry }}{% endif %}</div>
+    </div>
+    <div class="price-block">
+      <div class="price">{{ result.price }}</div>
+      {% if result.w52_low and result.w52_high %}
+      <div class="w52">52W: ${{ result.w52_low }} – ${{ result.w52_high }}</div>
+      {% endif %}
+    </div>
+  </div>
+
+  {# ── KPI 카드 ── #}
+  <div class="card">
+    <div class="card-header">📊 Key Metrics</div>
+    <div class="kpi-grid">
+      {% if result.est.trailing_pe %}
+      <div class="kpi-item">
+        <div class="kpi-label">Trailing P/E</div>
+        <div class="kpi-val">{{ result.est.trailing_pe | round(1) }}x</div>
+      </div>
+      {% endif %}
+      {% if result.est.fwd_pe %}
+      <div class="kpi-item">
+        <div class="kpi-label">Forward P/E</div>
+        <div class="kpi-val">{{ result.est.fwd_pe | round(1) }}x</div>
+      </div>
+      {% endif %}
+      {% if result.est.peg %}
+      <div class="kpi-item">
+        <div class="kpi-label">PEG</div>
+        <div class="kpi-val">{{ result.est.peg | round(2) }}</div>
+      </div>
+      {% endif %}
+      {% if result.est.psr_trailing %}
+      <div class="kpi-item">
+        <div class="kpi-label">P/S</div>
+        <div class="kpi-val">{{ result.est.psr_trailing | round(1) }}x</div>
+      </div>
+      {% endif %}
+      {% if result.beta %}
+      <div class="kpi-item">
+        <div class="kpi-label">Beta</div>
+        <div class="kpi-val">{{ result.beta }}</div>
+      </div>
+      {% endif %}
+      {% if result.market_cap %}
+      <div class="kpi-item">
+        <div class="kpi-label">Mkt Cap</div>
+        <div class="kpi-val">${{ result.market_cap }}B</div>
+      </div>
+      {% endif %}
+      {% if result.roe_pct %}
+      <div class="kpi-item">
+        <div class="kpi-label">ROE</div>
+        <div class="kpi-val">{{ result.roe_pct }}%</div>
+      </div>
+      {% endif %}
+      {% if result.roa_pct %}
+      <div class="kpi-item">
+        <div class="kpi-label">ROA</div>
+        <div class="kpi-val">{{ result.roa_pct }}%</div>
+      </div>
+      {% endif %}
+      {% if result.de_ratio %}
+      <div class="kpi-item">
+        <div class="kpi-label">Debt/Equity</div>
+        <div class="kpi-val">{{ result.de_ratio | round(1) }}%</div>
+      </div>
+      {% endif %}
+      {% if result.div_yield %}
+      <div class="kpi-item">
+        <div class="kpi-label">Div Yield</div>
+        <div class="kpi-val">{{ result.div_yield }}%</div>
+        {% if result.div_rate %}<div class="kpi-sub">${{ result.div_rate }}/yr</div>{% endif %}
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  {# ── 애널리스트 섹션 ── #}
+  {% if result.est.target_mean or result.est.curr_yr_eps %}
+  <div class="card">
+    <div class="card-header">🎯 Analyst Consensus</div>
+    <div class="analyst-grid">
+
+      {# 목표가 #}
+      {% if result.est.target_mean %}
+      <div class="analyst-box">
+        <h4>Price Target ({{ result.est.n_analysts }} analysts)</h4>
+        <div class="tp-row">
+          <span class="label">Mean</span>
+          <span class="value {% if result.est.target_mean > (result.est.price or 0) %}up{% else %}down{% endif %}">
+            ${{ result.est.target_mean | round(2) }}
+          </span>
+        </div>
+        {% if result.est.target_median %}
+        <div class="tp-row">
+          <span class="label">Median</span>
+          <span class="value">${{ result.est.target_median | round(2) }}</span>
+        </div>
+        {% endif %}
+        <div class="tp-row">
+          <span class="label">High</span>
+          <span class="value up">${{ result.est.target_high }}</span>
+        </div>
+        <div class="tp-row">
+          <span class="label">Low</span>
+          <span class="value down">${{ result.est.target_low }}</span>
+        </div>
+        {% if result.est.price and result.est.target_mean %}
+        {% set upside = ((result.est.target_mean - result.est.price) / result.est.price * 100) | round(1) %}
+        <div class="tp-row" style="margin-top:8px; border-top:1px solid #e2e8f0; padding-top:6px;">
+          <span class="label">Upside (mean)</span>
+          <span class="value {% if upside > 0 %}up{% else %}down{% endif %}">{{ upside }}%</span>
+        </div>
+        {% endif %}
+        {% if result.est.recommendation %}
+        <div style="margin-top:10px;">
+          <span class="rec-badge {% if 'Buy' in result.est.recommendation %}rec-buy{% elif 'Hold' in result.est.recommendation %}rec-hold{% else %}rec-sell{% endif %}">
+            {{ result.est.recommendation }}
+          </span>
+        </div>
+        {% endif %}
+      </div>
+      {% endif %}
+
+      {# EPS / Revenue 추정 #}
+      <div class="analyst-box">
+        <h4>Earnings &amp; Revenue Estimates</h4>
+        <table class="est-table">
+          <thead>
+            <tr><th>Period</th><th>EPS Est.</th><th>Growth</th><th>Rev Est.</th></tr>
+          </thead>
+          <tbody>
+            {% if result.est.curr_yr_eps %}
+            <tr>
+              <td><span class="tag-curr">CY</span></td>
+              <td>${{ result.est.curr_yr_eps | round(2) }}
+                {% if result.est.curr_yr_eps_low and result.est.curr_yr_eps_high %}
+                <span style="font-size:10px;color:#a0aec0;">
+                  (${{ result.est.curr_yr_eps_low | round(2) }}–${{ result.est.curr_yr_eps_high | round(2) }})
+                </span>
+                {% endif %}
+              </td>
+              <td>{% if result.est.curr_yr_growth %}
+                {{ (result.est.curr_yr_growth * 100) | round(1) }}%
+              {% else %}-{% endif %}</td>
+              <td>{% if result.est.curr_yr_rev %}${{ result.est.curr_yr_rev }}B{% else %}-{% endif %}</td>
+            </tr>
+            {% endif %}
+            {% if result.est.next_yr_eps %}
+            <tr>
+              <td><span class="tag-next">+1Y</span></td>
+              <td>${{ result.est.next_yr_eps | round(2) }}
+                {% if result.est.next_yr_eps_low and result.est.next_yr_eps_high %}
+                <span style="font-size:10px;color:#a0aec0;">
+                  (${{ result.est.next_yr_eps_low | round(2) }}–${{ result.est.next_yr_eps_high | round(2) }})
+                </span>
+                {% endif %}
+              </td>
+              <td>{% if result.est.next_yr_growth %}
+                {{ (result.est.next_yr_growth * 100) | round(1) }}%
+              {% else %}-{% endif %}</td>
+              <td>{% if result.est.next_yr_rev %}${{ result.est.next_yr_rev }}B{% else %}-{% endif %}</td>
+            </tr>
+            {% endif %}
+          </tbody>
+        </table>
+
+        {% if result.est.trailing_eps %}
+        <div style="margin-top:10px; font-size:12px; color:#718096;">
+          Trailing EPS: <strong>${{ result.est.trailing_eps }}</strong>
+          &nbsp;|&nbsp; Forward EPS: <strong>${{ result.est.fwd_eps }}</strong>
+        </div>
+        {% endif %}
+      </div>
+
+    </div>
+  </div>
+  {% endif %}
+
+  {# ── 재무제표 히스토리 ── #}
+  <div class="card">
+    <div class="card-header">📋 Annual Financials (Yahoo Finance)</div>
+    <div style="padding:12px 20px; overflow-x:auto;">
+      {{ result.raw_table | safe }}
+    </div>
+    <p style="padding:6px 20px 12px; color:#a0aec0; font-size:11px;">
+      Units: Revenue / Income / CF in B$ (billions USD) · EPS / BPS in $ per share · Margins in %
+    </p>
+  </div>
+
+  {# ── 밸류에이션 밴드 ── #}
+  {% if result.band %}
+  <div class="card">
+    <div class="card-header">📈 Relative Valuation Bands (Historical Average ± σ)</div>
+    <div class="band-grid">
+      {% for b in result.band %}
+        {% if b.error %}
+        <div class="band-card" style="opacity:0.5;">
+          <h3>{{ b.metric }}</h3>
+          <p style="font-size:12px;color:#a0aec0;">{{ b.error }}</p>
+        </div>
+        {% else %}
+        <div class="band-card">
+          <h3>{{ b.metric }}
+            {% if b.fwd_val %}
+            <span style="font-size:12px;font-weight:400;color:#718096;"> Current: {{ b.fwd_val }}</span>
+            {% endif %}
+          </h3>
+          <div class="band-row"><span class="bk">Hist. Avg</span><span class="bv">{{ b.hist_avg }}</span></div>
+          <div class="band-row"><span class="bk">Hist. Std</span><span class="bv">± {{ b.hist_std }}</span></div>
+          <div class="band-row"><span class="bk">-2σ</span><span class="bv">{{ b.bands.m2s }}</span></div>
+          <div class="band-row"><span class="bk">-1σ</span><span class="bv">{{ b.bands.m1s }}</span></div>
+          <div class="band-row" style="font-weight:700;background:#f0f4f8;">
+            <span class="bk">Avg</span><span class="bv">{{ b.bands.avg }}</span>
+          </div>
+          <div class="band-row"><span class="bk">+1σ</span><span class="bv">{{ b.bands.p1s }}</span></div>
+          <div class="band-row"><span class="bk">+2σ</span><span class="bv">{{ b.bands.p2s }}</span></div>
+          {% if b.grade_fwd %}
+          <div style="margin-top:8px;">
+            <span class="grade-chip grade-{{ b.grade_fwd | replace(' ', '-') }}">{{ b.grade_fwd }}</span>
+          </div>
+          {% endif %}
+          {% if b.theory_fwd %}
+          <div class="theory-row">
+            Implied Price ({{ b.base_label }}): <strong>${{ b.theory_fwd }}</strong>
+            {% if b.diff_pct_fwd %}
+            <span class="{% if b.diff_pct_fwd[0] == '+' %}up{% else %}down{% endif %}">
+              ({{ b.diff_pct_fwd }}%)
+            </span>
+            {% endif %}
+          </div>
+          {% endif %}
+        </div>
+        {% endif %}
+      {% endfor %}
+    </div>
+    <p style="padding:6px 20px 12px;color:#a0aec0;font-size:11px;">
+      Bands based on historical multiples using current stock price as basis. Negative-EPS years excluded.
+    </p>
+  </div>
+  {% endif %}
+
+  {# ── DCF ── #}
+  {% if result.dcf %}
+  <div class="card">
+    <div class="card-header">💰 DCF Valuation (FCF-based, 3-Year Projection)</div>
+
+    {% if result.dcf.error %}
+    <p style="padding:16px;color:#e53e3e;">{{ result.dcf.error }}</p>
+    {% else %}
+
+    {# FCF 히스토리 #}
+    {% if result.dcf.hist_fcf %}
+    <div style="padding:12px 20px 4px; font-size:12px; color:#4a5568;">
+      <strong>Historical FCF</strong> (Operating CF − Capex, used for margin average)
+      &nbsp;|&nbsp; Shares: <strong>{{ result.dcf.shares }}B</strong>
+      <div style="overflow-x:auto; margin-top:8px;">
+        <table class="fcf-hist-table">
+          <thead><tr>
+            <th style="text-align:left;">Year</th>
+            <th>Op CF (B$)</th>
+            <th>Capex (B$)</th>
+            <th>FCF (B$)</th>
+            <th>FCF Margin</th>
+            <th>Source</th>
+          </tr></thead>
+          <tbody>
+          {% for h in result.dcf.hist_fcf %}
+          <tr class="{% if h.excluded %}excluded-row{% endif %}">
+            <td>{{ h.year }}{% if h.excluded %} <span style="color:#e53e3e;font-size:10px;">excluded</span>{% endif %}</td>
+            <td>{% if h.op_cf %}{{ h.op_cf }}{% else %}-{% endif %}</td>
+            <td>{% if h.capex %}{{ h.capex }}{% else %}-{% endif %}</td>
+            <td class="{% if h.fcf < 0 %}neg{% endif %}">{{ h.fcf }}</td>
+            <td class="{% if h.margin < 0 %}neg{% endif %}">{{ h.margin }}%</td>
+            <td style="color:#a0aec0;">{{ h.src }}</td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% endif %}
+
+    {# DCF 결과 테이블 #}
+    <div style="overflow-x:auto; padding:12px 20px 4px;">
+      <table class="val-table">
+        <thead>
+          <tr>
+            <th></th>
+            {% for row in result.dcf.pv_fcfs %}<th>{{ row.year }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Est. FCF (B$)</td>
+            {% for row in result.dcf.pv_fcfs %}<td>${{ row.fcf }}</td>{% endfor %}
+          </tr>
+          <tr>
+            <td>PV of FCF (B$)</td>
+            {% for row in result.dcf.pv_fcfs %}<td>${{ row.pv }}</td>{% endfor %}
+          </tr>
+          <tr>
+            <td>PV of Terminal Value (B$)</td>
+            {% for row in result.dcf.pv_fcfs %}<td>${{ row.pv_tv }}</td>{% endfor %}
+          </tr>
+          <tr>
+            <td>Total Intrinsic Value (B$)</td>
+            {% for row in result.dcf.pv_fcfs %}<td>${{ row.total_pv }}</td>{% endfor %}
+          </tr>
+          <tr>
+            <td><strong>Fair Value / Share</strong></td>
+            {% for row in result.dcf.pv_fcfs %}
+            <td><span class="fair-val">{{ row.fair_value }}</span></td>
+            {% endfor %}
+          </tr>
+          <tr>
+            <td>vs. Current Price</td>
+            {% for row in result.dcf.pv_fcfs %}
+            <td>
+              {% if row.diff %}
+              <span class="{% if row.diff[0] == '+' %}diff-up{% else %}diff-down{% endif %}">
+                {{ row.diff }} ({{ row.diff_pct }}%)
+              </span>
+              {% else %}-{% endif %}
+            </td>
+            {% endfor %}
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="padding:6px 20px 12px;color:#a0aec0;font-size:12px;">
+      Avg FCF Margin: {{ result.dcf.avg_fcf_margin }}% ·
+      Rev Growth (CAGR): {{ result.dcf.rev_growth }}% ·
+      Discount Rate: {{ result.dcf.r }}% (rf {{ result.dcf.rf }}% + β{{ result.dcf.beta }} × 5.5%) ·
+      Terminal Growth: {{ result.dcf.g_terminal }}%
+      &nbsp;|&nbsp; Negative-FCF years excluded from margin average
+    </p>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% endif %} {# result.error #}
+{% endif %} {# result #}
+
+{% if not result %}
+<div style="text-align:center;padding:60px 20px;color:#718096;">
+  <div style="font-size:48px;">🇺🇸</div>
+  <p style="margin-top:12px;font-size:16px;font-weight:600;color:#4a5568;">Enter a US ticker to get started</p>
+  <p style="margin-top:6px;font-size:13px;">e.g. AAPL · MSFT · NVDA · GOOGL · AMZN · META · TSLA</p>
+</div>
+{% endif %}
+
+</body>
+</html>
