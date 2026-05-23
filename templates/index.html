@@ -310,8 +310,8 @@
     font-size: 11px; font-weight: 700; margin-bottom: 6px;
   }
   .rdcf-mature       { background:#ebf4ff; color:#2b6cb0; }
-  .rdcf-high_growth  { background:#c6f6d5; color:#276749; }
-  .rdcf-unprofitable { background:#fed7d7; color:#9b2335; }
+  .rdcf-high_growth  { background:#fed7d7; color:#9b2335; }
+  .rdcf-cyclical     { background:#fefcbf; color:#744210; }
 
   .rdcf-schedule-table { width:100%; border-collapse:collapse; font-size:12px; }
   .rdcf-schedule-table th {
@@ -791,24 +791,32 @@
   {# ── Rolling DCF (Damodaran) ── #}
   {% if result.rdcf and not result.rdcf.error %}
   {% set rd = result.rdcf %}
+  {# firm_type 표시명 및 색상 매핑 #}
+  {% set ft_label = {'mature':'성숙기','hyper_growth':'고성장·적자','cyclical':'경기순환'}[rd.firm_type] | default(rd.firm_type) %}
+  {% set ft_class = {'mature':'rdcf-mature','hyper_growth':'rdcf-high_growth','cyclical':'rdcf-cyclical'}[rd.firm_type] | default('rdcf-mature') %}
   <div class="card">
     <div class="card-header">🎯 롤링 DCF 적정주가 (Damodaran 방법론)
       <span style="font-size:11px;font-weight:400;color:#718096;margin-left:8px;">
-        FCF = EBIT(1-t) + D&amp;A − CapEx − △NWC
+        FCF = NOPAT − 재투자 (Sales-to-Capital)
       </span>
     </div>
 
     {# ── 파라미터 요약 배지 ── #}
     <div style="padding:12px 20px 0; display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
-      <span class="rdcf-badge rdcf-{{ rd.firm_type }}">
-        {{ {'mature':'성숙기','high_growth':'고성장','unprofitable':'적자'}[rd.firm_type] }}
+      <span class="rdcf-badge {{ ft_class }}">
+        {{ ft_label }}
         &nbsp;·&nbsp; {{ rd.horizon }}년 호라이즌
       </span>
+      {% if rd.survival_prob < 1.0 %}
+      <span class="rdcf-badge" style="background:#fed7d7;color:#9b2335;">
+        생존확률 {{ (rd.survival_prob * 100)|int }}%
+      </span>
+      {% endif %}
       <span style="font-size:12px;color:#718096;">
         WACC <strong>{{ rd.wacc }}%</strong>
         (rf {{ rd.rf }}% + β{{ rd.beta }} × ERP 5.5%)
         &nbsp;·&nbsp; 영구성장률 <strong>{{ rd.terminal_g }}%</strong>
-        &nbsp;·&nbsp; 업종 EBIT 마진 수렴 <strong>{{ rd.industry_margin }}%</strong>
+        &nbsp;·&nbsp; EBIT 마진 수렴 <strong>{{ rd.industry_margin }}%</strong>
         &nbsp;·&nbsp; 세율 <strong>{{ rd.tax_rate }}%</strong>
       </span>
     </div>
@@ -826,7 +834,10 @@
         </div>
         {% endif %}
         <div class="sub-rows">
-          <span>프로젝션 {{ t.proj_window }}</span>
+          <span>프로젝션 {{ t.proj_window }} ({{ t.horizon }}년)</span>
+          {% if t.survival_prob < 1.0 %}
+          <span style="color:#e53e3e;">생존확률 {{ (t.survival_prob*100)|int }}% 반영</span>
+          {% endif %}
           <span>EV  ${{ t.ev_B }}B</span>
           <span>현금 ${{ t.base_cash_B }}B · 부채 ${{ t.debt_B }}B</span>
           <span>내재 시총 ${{ t.equity_B }}B</span>
@@ -891,11 +902,13 @@
     {% endif %}
 
     <p style="padding:10px 20px 14px;color:#a0aec0;font-size:11px;">
-      Damodaran Rolling DCF (Safety-Guarded v2):
-      재투자 = 매출 증분 ÷ Sales-to-Capital({{ rd.stc }}) [Guard 3] ·
-      성장률 → rf 선형 수렴 [Guard 1] ·
+      Damodaran Rolling DCF v3 ({{ ft_label }}) —
+      재투자 = 매출 증분 ÷ S/Capital({{ rd.stc }}) [Guard 3] ·
+      성장률 → rf 수렴 [Guard 1] ·
       EBIT 마진 → {{ rd.industry_margin }}% 수렴 [Guard 2] ·
-      TV = FCF<sub>Y11</sub> ÷ (WACC − rf) [Guard 4]
+      TV = FCF<sub>Y+end+1</sub> ÷ (WACC − rf) [Guard 4]
+      {% if rd.firm_type == 'hyper_growth' %} · EV × 생존확률 {{ (rd.survival_prob*100)|int }}% 반영{% endif %}
+      {% if rd.firm_type == 'cyclical' %} · 장기 마진 → 10년 역사적 평균 수렴 · 재투자 한도(매출 대비) 적용{% endif %}
     </p>
   </div>
   {% elif result.rdcf and result.rdcf.error %}
