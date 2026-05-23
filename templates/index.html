@@ -233,6 +233,60 @@
   .diff-up   { color: #38a169; font-weight: 700; }
   .diff-down { color: #e53e3e; font-weight: 700; }
 
+  /* ── Rolling DCF ── */
+  .rdcf-target-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+    padding: 16px 20px;
+  }
+  .rdcf-target-card {
+    background: #f7fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 16px;
+    text-align: center;
+  }
+  .rdcf-target-card .yr-label {
+    font-size: 12px; font-weight: 700; color: #718096;
+    text-transform: uppercase; letter-spacing: .5px;
+  }
+  .rdcf-target-card .tp {
+    font-size: 30px; font-weight: 900; color: #1a365d;
+    margin: 6px 0 4px;
+  }
+  .rdcf-target-card .upside-up   { color: #38a169; font-size: 14px; font-weight: 700; }
+  .rdcf-target-card .upside-down { color: #e53e3e; font-size: 14px; font-weight: 700; }
+  .rdcf-target-card .sub-rows    { font-size: 11px; color: #718096; margin-top: 8px; line-height: 1.8; }
+  .rdcf-target-card .sub-rows span { display: block; }
+  .rdcf-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 700; margin-bottom: 6px;
+  }
+  .rdcf-mature       { background:#ebf4ff; color:#2b6cb0; }
+  .rdcf-high_growth  { background:#c6f6d5; color:#276749; }
+  .rdcf-unprofitable { background:#fed7d7; color:#9b2335; }
+
+  .rdcf-schedule-table { width:100%; border-collapse:collapse; font-size:12px; }
+  .rdcf-schedule-table th {
+    background:#edf2f7; padding:6px 10px;
+    text-align:right; font-weight:700; color:#4a5568;
+    border-bottom:2px solid #e2e8f0; white-space:nowrap;
+  }
+  .rdcf-schedule-table th:first-child { text-align:left; }
+  .rdcf-schedule-table td {
+    padding:5px 10px; border-bottom:1px solid #edf2f7;
+    text-align:right; white-space:nowrap;
+  }
+  .rdcf-schedule-table td:first-child { text-align:left; font-weight:600; }
+  .rdcf-schedule-table tr.consensus-row td { background:#fffbeb; }
+  .rdcf-schedule-table tr.ext-row td      { background:#f7fafc; color:#718096; }
+  .rdcf-schedule-table tr:last-child td   { border-bottom:none; }
+
+  @media (max-width:700px) {
+    .rdcf-target-grid { grid-template-columns: 1fr; }
+  }
+
   /* ── FCF 히스토리 테이블 ── */
   .fcf-hist-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .fcf-hist-table th { background: #f0f4f8; padding: 6px 12px; border-bottom: 2px solid #e2e8f0;
@@ -720,6 +774,123 @@
       &nbsp;|&nbsp; FCF 음수 연도는 마진 평균 계산에서 제외
     </p>
     {% endif %}
+  </div>
+  {% endif %}
+
+  {# ── Rolling DCF (Damodaran) ── #}
+  {% if result.rdcf and not result.rdcf.error %}
+  {% set rd = result.rdcf %}
+  <div class="card">
+    <div class="card-header">🎯 롤링 DCF 적정주가 (Damodaran 방법론)
+      <span style="font-size:11px;font-weight:400;color:#718096;margin-left:8px;">
+        FCF = EBIT(1-t) + D&amp;A − CapEx − △NWC
+      </span>
+    </div>
+
+    {# ── 파라미터 요약 배지 ── #}
+    <div style="padding:12px 20px 0; display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+      <span class="rdcf-badge rdcf-{{ rd.firm_type }}">
+        {{ {'mature':'성숙기','high_growth':'고성장','unprofitable':'적자'}[rd.firm_type] }}
+        &nbsp;·&nbsp; {{ rd.horizon }}년 호라이즌
+      </span>
+      <span style="font-size:12px;color:#718096;">
+        WACC <strong>{{ rd.wacc }}%</strong>
+        (rf {{ rd.rf }}% + β{{ rd.beta }} × ERP 5.5%)
+        &nbsp;·&nbsp; 영구성장률 <strong>{{ rd.terminal_g }}%</strong>
+        &nbsp;·&nbsp; 업종 EBIT 마진 수렴 <strong>{{ rd.industry_margin }}%</strong>
+        &nbsp;·&nbsp; 세율 <strong>{{ rd.tax_rate }}%</strong>
+      </span>
+    </div>
+
+    {# ── 연도별 목표주가 3개 카드 ── #}
+    <div class="rdcf-target-grid">
+      {% for t in rd.targets %}
+      <div class="rdcf-target-card">
+        <div class="yr-label">{{ t.year }}년말 목표주가</div>
+        <div class="tp">${{ t.target_price }}</div>
+        {% if t.upside_pct is not none %}
+        <div class="{% if t.upside_pct >= 0 %}upside-up{% else %}upside-down{% endif %}">
+          {% if t.upside_pct >= 0 %}▲{% else %}▼{% endif %}
+          {{ t.upside_pct | abs }}% 현재가 대비
+        </div>
+        {% endif %}
+        <div class="sub-rows">
+          <span>프로젝션 {{ t.proj_window }}</span>
+          <span>EV  ${{ t.ev_B }}B</span>
+          <span>현금 ${{ t.base_cash_B }}B · 부채 ${{ t.debt_B }}B</span>
+          <span>내재 시총 ${{ t.equity_B }}B</span>
+          <span style="padding-top:4px;border-top:1px solid #e2e8f0;margin-top:4px;">
+            PV(FCF) ${{ t.pv_fcfs_B }}B + PV(TV) ${{ t.pv_tv_B }}B
+          </span>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+    {# ── FCF 전체 스케줄 ── #}
+    {% if rd.schedule %}
+    <div style="padding:4px 20px 0;">
+      <div style="font-size:12px;font-weight:700;color:#4a5568;margin-bottom:6px;">
+        FCF 스케줄 (B$) &nbsp;
+        <span style="font-weight:400;color:#a0aec0;">
+          <span style="background:#fffbeb;padding:1px 5px;border-radius:3px;">컨센서스</span>
+          &nbsp;
+          <span style="background:#f7fafc;padding:1px 5px;border-radius:3px;color:#718096;">외삽</span>
+        </span>
+      </div>
+      <div style="overflow-x:auto;">
+        <table class="rdcf-schedule-table">
+          <thead>
+            <tr>
+              <th style="text-align:left;">연도</th>
+              <th>매출 (B$)</th>
+              <th>매출성장</th>
+              <th>EBIT 마진</th>
+              <th>NOPAT</th>
+              <th>D&amp;A</th>
+              <th>CapEx</th>
+              <th>FCF</th>
+              <th>구분</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for s in rd.schedule %}
+          <tr class="{% if s.source == 'consensus' %}consensus-row{% else %}ext-row{% endif %}">
+            <td>{{ s.year }}</td>
+            <td>{{ s.revenue }}</td>
+            <td>{% if s.rev_growth is not none %}{{ s.rev_growth }}%{% else %}—{% endif %}</td>
+            <td>{{ s.ebit_margin }}%</td>
+            <td>{{ s.nopat }}</td>
+            <td>{{ s.da }}</td>
+            <td>{{ s.capex }}</td>
+            <td style="font-weight:{% if s.source=='consensus' %}700{% else %}400{% endif %};">
+              {{ s.fcf }}
+            </td>
+            <td style="font-size:10px;">
+              {% if s.source == 'consensus' %}
+              <span style="color:#b7791f;">컨센서스</span>
+              {% else %}
+              <span style="color:#a0aec0;">외삽</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% endif %}
+
+    <p style="padding:10px 20px 14px;color:#a0aec0;font-size:11px;">
+      Damodaran Rolling DCF: 각 연도말 기준 잔여 호라이즌 FCF + 터미널 밸류 현재가치 합산.
+      컨센서스 이후 매출 성장률은 rf 수준으로 선형 수렴, EBIT 마진은 업종 평균으로 수렴.
+      현금·부채·발행주식수는 Yahoo Finance 기준.
+    </p>
+  </div>
+  {% elif result.rdcf and result.rdcf.error %}
+  <div class="card">
+    <div class="card-header">🎯 롤링 DCF 적정주가 (Damodaran)</div>
+    <p style="padding:14px 20px;color:#e53e3e;font-size:13px;">{{ result.rdcf.error[:300] }}</p>
   </div>
   {% endif %}
 

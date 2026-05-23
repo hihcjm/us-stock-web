@@ -818,6 +818,248 @@ def build_fin_table(hist_annual):
     body += '</tbody>'
     return f'<table class="financial-table">{header}{body}</table>'
 
+# ── 6-b. Rolling DCF (Damodaran) ─────────────────────────────────
+def calc_rolling_dcf(hist_annual, estimates):
+    """
+    yfinance + Stockanalysis 데이터를 rolling_dcf 모듈 입력 형식으로 변환 후
+    calculate_rolling_targets() 호출.
+    반환: {
+      'firm_type': 'mature'|'high_growth'|'unprofitable',
+      'horizon': 5|10,
+      'wacc': 11.22,
+      'rf': 4.4,
+      'beta': 1.24,
+      'terminal_g': 2.5,
+      'industry_margin': 25.0,
+      'schedule': [ {year, revenue, rev_growth, ebit_margin, nopat, da, capex, fcf, source}, ... ],
+      'targets': [ {year, proj_window, pv_fcfs_B, pv_tv_B, ev_B,
+                    base_cash_B, debt_B, equity_B, target_price, upside_pct}, ... ],
+    }
+    """
+    try:
+        from api.rolling_dcf import (
+            Financials2025, ConsensusYear, DCFParams,
+            classify_firm, _wacc,
+            calculate_rolling_targets, build_full_schedule,
+        )
+    except ImportError:
+        try:
+            import sys, os
+            sys.path.insert(0, os.path.dirname(__file__))
+            from rolling_dcf import (
+                Financials2025, ConsensusYear, DCFParams,
+                classify_firm, _wacc,
+                calculate_rolling_targets, build_full_schedule,
+            )
+        except ImportError as e:
+            return {"error": f"rolling_dcf import failed: {e}"}
+
+    try:
+        rows  = hist_annual['rows']
+        years = hist_annual['years']
+        est   = estimates
+        info  = est
+        sa    = est.get('sa') or {}
+
+        # ── rf 실시간 취득 ──────────────────────────────────────────
+        try:
+            tnx = yf.Ticker('^TNX')
+            tnx_hist = tnx.history(period='5d')
+            rf = float(tnx_hist['Close'].iloc[-1]) / 100 if not tnx_hist.empty else 0.044
+        except:
+            rf = 0.044
+
+        beta = safe_float(est.get('beta')) or 1.0
+
+        # ── 최신 연도 실적 추출 (index 0 = 가장 최근) ───────────────
+        def get_latest(key):
+            vals = rows.get(key, [])
+            for v in vals:
+                if v is not None:
+                    return v
+            return None
+
+        def get_two_latest(key):
+            """최근 두 개 비-None 값 반환 (최신, 직전)"""
+            vals = [v for v in rows.get(key, []) if v is not None]
+            return (vals[0], vals[1]) if len(vals) >= 2 else (vals[0] if vals else None, None)
+
+        rev_latest, rev_prev = get_two_latest('Revenue')
+        op_latest  = get_latest('Operating Income')
+        rev_latest = rev_latest or 1.0
+
+        # EBIT margin (Operating Income / Revenue)
+        ebit_margin = (op_latest / rev_latest) if op_latest and rev_latest else 0.0
+
+        # Revenue growth (최신 YoY)
+        rev_growth_act = ((rev_latest / rev_prev) - 1) if rev_prev and rev_prev > 0 else 0.05
+
+        # D&A: 영업CF - 순이익 근사 (직접 행 없으면 매출 4% 사용)
+        op_cf_latest = get_latest('Op CF')
+        net_latest   = get_latest('Net Income')
+        if op_cf_latest and net_latest:
+            da_approx = max(op_cf_latest - net_latest, 0.0)
+        else:
+            da_approx = rev_latest * 0.04
+
+        capex_latest = get_latest('Capex') or rev_latest * 0.05
+
+        # NWC delta 근사 (매출 × 2%)
+        delta_nwc_approx = rev_latest * rev_growth_act * 0.02
+
+        # Cash & Debt (info에서)
+        cash_raw  = safe_float(info.get('shares_outstanding'))   # 주 단위 (재활용 안 함)
+        price     = safe_float(info.get('price') or hist_annual.get('price'))
+
+        # yfinance info에서 현금·부채 직접 취득
+        raw_data  = est.get('_raw_info', {})   # analyze_us_stock에서 주입
+        cash_b    = fmt_b(safe_float(raw_data.get('totalCash')))      or 0.0
+        debt_b    = fmt_b(safe_float(raw_data.get('totalDebt')))      or 0.0
+
+        # shares (B주)
+        sh_raw = safe_float(info.get('shares_outstanding'))
+        shares_b = (sh_raw / 1e9) if sh_raw and sh_raw > 1e6 else None
+        if not shares_b:
+            mktcap_b = safe_float(info.get('market_cap'))
+            if mktcap_b and price:
+                shares_b = mktcap_b / price
+        shares_b = shares_b or 1.0
+
+        # ── Financials2025 구성 ─────────────────────────────────────
+        f2025 = Financials2025(
+            ebit_margin    = ebit_margin,
+            revenue_growth = rev_growth_act,
+            revenue        = rev_latest,
+            ebit           = op_latest or rev_latest * ebit_margin,
+            da             = da_approx,
+            capex          = capex_latest,
+            delta_nwc      = delta_nwc_approx,
+            cash           = cash_b,
+            debt           = debt_b,
+            shares         = shares_b,
+        )
+
+        # ── ConsensusYear 구성 (SA → yfinance 순) ──────────────────
+        sa_rev = sa.get('rev', {})
+        sa_eps = sa.get('eps', {})
+
+        # 컨센서스 연도별 EBIT margin: SA에 없으면 최신 실적 마진 유지
+        def consensus_ebit_margin(fy_key: str) -> float:
+            # SA에 ebit_margin 없으므로: EPS/Rev 역산 or 현재 마진 유지
+            return ebit_margin  # 보수적 유지 (수렴은 extrapolation에서 처리)
+
+        # D&A·CapEx 비율: 과거 실적 기반
+        da_pct    = da_approx / rev_latest if rev_latest else 0.04
+        capex_pct = capex_latest / rev_latest if rev_latest else 0.05
+        nwc_pct   = 0.02
+
+        consensus_years = []
+        # SA에 있는 연도 (FY2026, FY2027, FY2028)
+        for yr_int in (2026, 2027, 2028):
+            fy_key = f'FY{yr_int}'
+            rev_d  = sa_rev.get(fy_key, {})
+            rev_v  = rev_d.get('avg')
+
+            # SA 없으면 yfinance 0y/+1y 대체
+            if not rev_v:
+                if yr_int == 2026:
+                    rev_v = est.get('curr_yr_rev')
+                elif yr_int == 2027:
+                    rev_v = est.get('next_yr_rev')
+
+            if not rev_v:
+                # 직전 연도 기반 성장률 연장
+                prev_con = [c for c in consensus_years]
+                if prev_con:
+                    last_r = prev_con[-1].revenue
+                    rev_v  = last_r * (1 + max(rev_growth_act, 0.03))
+                else:
+                    rev_v  = rev_latest * (1 + max(rev_growth_act, 0.03))
+
+            consensus_years.append(ConsensusYear(
+                year        = yr_int,
+                revenue     = rev_v,
+                ebit_margin = consensus_ebit_margin(fy_key),
+                da          = rev_v * da_pct,
+                capex       = rev_v * capex_pct,
+                delta_nwc   = rev_v * nwc_pct * max(rev_growth_act, 0.03),
+            ))
+
+        # industry EBIT margin: 현재 마진과 25% 중간값 사용
+        industry_margin = max(min(ebit_margin, 0.35), 0.10)
+
+        # ── DCFParams ───────────────────────────────────────────────
+        params = DCFParams(
+            tax_rate             = 0.21,
+            risk_free_rate       = rf,
+            erp                  = 0.055,
+            beta                 = beta,
+            terminal_growth      = rf * 0.6,   # rf의 60% (Damodaran 권장)
+            industry_ebit_margin = industry_margin,
+            da_pct_revenue       = da_pct,
+            capex_pct_revenue    = capex_pct,
+            nwc_pct_revenue      = nwc_pct,
+        )
+        # terminal_growth는 최소 2%, 최대 3.5%로 클램프
+        params.terminal_growth = max(0.02, min(params.terminal_growth, 0.035))
+
+        firm_type, horizon = classify_firm(f2025)
+        wacc_val = _wacc(params)
+
+        # ── FCF 스케줄 ──────────────────────────────────────────────
+        schedule_df = build_full_schedule(consensus_years, params, firm_type, horizon)
+        schedule = []
+        for yr, row in schedule_df.iterrows():
+            schedule.append({
+                'year':        int(yr),
+                'revenue':     row.get('revenue'),
+                'rev_growth':  row.get('rev_growth'),
+                'ebit_margin': row.get('ebit_margin'),
+                'nopat':       row.get('nopat'),
+                'da':          row.get('da'),
+                'capex':       row.get('capex'),
+                'fcf':         row.get('fcf'),
+                'source':      row.get('source'),
+            })
+
+        # ── 롤링 타겟 ───────────────────────────────────────────────
+        targets_df = calculate_rolling_targets(f2025, consensus_years, params)
+        targets = []
+        for yr, row in targets_df.iterrows():
+            tp = float(row['target_price'])
+            upside = round((tp - price) / price * 100, 1) if price and price > 0 else None
+            targets.append({
+                'year':        int(yr),
+                'firm_type':   row['firm_type'],
+                'proj_window': row['proj_window'],
+                'pv_fcfs_B':   float(row['pv_fcfs_B']),
+                'pv_tv_B':     float(row['pv_tv_B']),
+                'ev_B':        float(row['ev_B']),
+                'base_cash_B': float(row['base_cash_B']),
+                'debt_B':      float(row['debt_B']),
+                'equity_B':    float(row['equity_B']),
+                'target_price': round(tp, 2),
+                'upside_pct':  upside,
+            })
+
+        return {
+            'firm_type':       firm_type,
+            'horizon':         horizon,
+            'wacc':            round(wacc_val * 100, 2),
+            'rf':              round(rf * 100, 2),
+            'beta':            round(beta, 2),
+            'terminal_g':      round(params.terminal_growth * 100, 2),
+            'industry_margin': round(industry_margin * 100, 1),
+            'tax_rate':        round(params.tax_rate * 100, 1),
+            'schedule':        schedule,
+            'targets':         targets,
+        }
+
+    except Exception:
+        import traceback
+        return {"error": traceback.format_exc()}
+
+
 # ── 7. 메인 분석 함수 ────────────────────────────────────────────
 def analyze_us_stock(ticker_symbol):
     ticker_symbol = ticker_symbol.strip().upper()
@@ -836,9 +1078,12 @@ def analyze_us_stock(ticker_symbol):
             return {"error": "Failed to parse financial history."}
 
         est     = get_estimates(raw)
+        # cash/debt raw info를 est에 주입 (rolling DCF 브리지용)
+        est['_raw_info'] = raw['info']
         dcf     = calc_dcf(hist, est)
         band    = calc_band(hist, est)
         fin_tbl = build_fin_table(hist)
+        rdcf    = calc_rolling_dcf(hist, est)
 
         return {
             "ticker":  ticker_symbol,
@@ -846,6 +1091,7 @@ def analyze_us_stock(ticker_symbol):
             "sector":  est.get('sector', ''),
             "industry": est.get('industry', ''),
             "price":   f"${est['price']:.2f}" if est.get('price') else "N/A",
+            "price_raw": est.get('price'),
             "w52_high": est.get('w52_high'),
             "w52_low":  est.get('w52_low'),
             "market_cap": est.get('market_cap'),
@@ -860,6 +1106,7 @@ def analyze_us_stock(ticker_symbol):
             "sa":        est.get('sa'),
             "dcf":       dcf,
             "band":      band,
+            "rdcf":      rdcf,
         }
     except Exception as e:
         import traceback
