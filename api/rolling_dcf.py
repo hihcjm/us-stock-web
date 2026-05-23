@@ -1,10 +1,13 @@
 """
-Rolling DCF Valuation Model — Damodaran Methodology
-======================================================
-Produces year-end target prices for 2026, 2027, 2028 using:
-  - Actual data  : 2021–2025
-  - Consensus    : 2026–2028  (Stockanalysis / manual input)
-  - Extrapolated : 2029–2038  (decay + margin convergence)
+Rolling DCF Valuation Model — Damodaran Methodology (v2, Safety-Guarded)
+=========================================================================
+Produces year-end target prices for 2026, 2027, 2028.
+
+Safety guards (mandatory, applied to ALL extrapolated years):
+  Guard 1 — Growth Decay      : rev growth decays linearly -> Risk_Free_Rate by Y10
+  Guard 2 — Margin Convergence: EBIT margin converges linearly -> Target_Industry_Margin by Y10
+  Guard 3 — Sales-to-Capital  : Reinvestment = DeltaRevenue / SalesToCapital (no separate CapEx/DA)
+  Guard 4 — Terminal Rate Cap : TV = FCF_Y11 / (WACC - rf);  terminal_g = rf;  WACC > rf enforced
 """
 
 from __future__ import annotations
@@ -22,59 +25,59 @@ import pandas as pd
 
 FirmType = Literal["mature", "high_growth", "unprofitable"]
 
+CONSENSUS_YEARS = (2026, 2027, 2028)
+ROLLING_BASES   = (2026, 2027, 2028)
+
 
 @dataclass
-class Financials2025:
-    """Snapshot of 2025 actual / preliminary actuals used for classification."""
-    ebit_margin: float        # EBIT / Revenue  (e.g. 0.31)
-    revenue_growth: float     # YoY  (e.g. 0.06 for 6 %)
-    revenue: float            # $B
-    ebit: float               # $B
-    da: float                 # Depreciation & Amortisation  $B
-    capex: float              # Capital Expenditure  $B (positive)
-    delta_nwc: float          # Increase in Net Working Capital  $B
-    cash: float               # Cash & equivalents  $B
-    debt: float               # Total debt  $B
-    shares: float             # Diluted shares outstanding  B shares
+class Financials:
+    """Latest-year actual snapshot (2025)."""
+    revenue:        float   # $B
+    ebit_margin:    float   # fraction  (negative allowed)
+    revenue_growth: float   # YoY fraction
+    cash:           float   # $B  (cash + ST investments)
+    debt:           float   # $B  total debt
+    shares:         float   # B diluted shares
 
 
 @dataclass
 class ConsensusYear:
-    """Single-year consensus estimate."""
-    year: int
-    revenue: float            # $B
-    ebit_margin: float        # fraction
-    da: float                 # $B
-    capex: float              # $B
-    delta_nwc: float          # $B
+    year:           int
+    revenue:        float   # $B
+    ebit_margin:    float   # fraction  (negative allowed)
 
 
 @dataclass
 class DCFParams:
-    """Global parameters for the DCF engine."""
-    tax_rate: float = 0.21
-    risk_free_rate: float = 0.044          # US 10-Y Treasury
-    erp: float = 0.055                     # Equity Risk Premium
-    beta: float = 1.0
-    terminal_growth: float = 0.025         # = risk_free_rate long-run proxy
-    industry_ebit_margin: float = 0.25     # Convergence target
-    da_pct_revenue: float = 0.04           # D&A as % rev in extrapolation
-    capex_pct_revenue: float = 0.05        # CapEx as % rev in extrapolation
-    nwc_pct_revenue: float = 0.02          # NWC as % rev (delta = growth × NWC)
+    risk_free_rate:         float = 0.044   # US 10-Y  (= terminal growth)
+    erp:                    float = 0.055   # Equity Risk Premium
+    beta:                   float = 1.0
+    tax_rate:               float = 0.21
+    target_industry_margin: float = 0.15   # Guard 2 convergence target
+    sales_to_capital:       float = 1.5    # Guard 3  ($1 reinvestment -> $X rev)
+    wacc:                   float = field(init=False, repr=True, default=0.0)
+
+    def __post_init__(self) -> None:
+        raw = self.risk_free_rate + self.beta * self.erp
+        # Guard 4: WACC must strictly exceed rf; minimum spread = 100 bps
+        self.wacc = max(raw, self.risk_free_rate + 0.01)
+
+    @property
+    def terminal_growth(self) -> float:
+        """Guard 4: terminal g === rf (immutable)."""
+        return self.risk_free_rate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  FIRM CLASSIFIER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def classify_firm(f: Financials2025) -> tuple[FirmType, int]:
+def classify_firm(f: Financials) -> tuple[FirmType, int]:
     """
-    Classify the firm and return (firm_type, projection_horizon).
-
-    Rules (Damodaran):
-      - Mature      : EBIT margin > 0  AND  revenue growth <= 10 %  → 5-year
-      - High Growth  : EBIT margin > 0  AND  revenue growth >  10 %  → 10-year
-      - Unprofitable : EBIT margin <= 0                               → 10-year
+    Damodaran classification -> projection horizon.
+      Mature      : EBIT margin > 0 AND rev growth <= 10%  -> 5-year
+      High Growth : EBIT margin > 0 AND rev growth > 10%   -> 10-year
+      Unprofitable: EBIT margin <= 0                        -> 10-year
     """
     if f.ebit_margin <= 0:
         return "unprofitable", 10
@@ -84,385 +87,332 @@ def classify_firm(f: Financials2025) -> tuple[FirmType, int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  FCF EXTRAPOLATION ENGINE
+# 3.  CONSENSUS -> FCF  (2026-2028, Guard 3 applied)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _decay_growth(
-    base_growth: float,
-    terminal_growth: float,
-    step: int,
-    horizon: int,
-) -> float:
+def consensus_to_fcf(
+    consensus: list[ConsensusYear],
+    actuals:   Financials,
+    params:    DCFParams,
+) -> pd.DataFrame:
     """
-    Linear decay from base_growth → terminal_growth over [1 .. horizon] steps.
-    step = 1 is the first extrapolated year beyond the consensus window.
+    Convert 2026-2028 consensus into FCF rows.
+    Guard 3: Reinvestment = DeltaRevenue / sales_to_capital
+    FCF = NOPAT - Reinvestment   (NOPAT = EBIT * (1-t), EBIT may be negative)
     """
-    if horizon <= 1:
-        return terminal_growth
-    alpha = (step - 1) / (horizon - 1)          # 0 → 1
-    return base_growth * (1 - alpha) + terminal_growth * alpha
+    rows: list[dict] = []
+    prev_rev = actuals.revenue
+
+    for c in sorted(consensus, key=lambda x: x.year):
+        ebit  = c.revenue * c.ebit_margin
+        nopat = ebit * (1 - params.tax_rate)
+        reinv = (c.revenue - prev_rev) / params.sales_to_capital
+        fcf   = nopat - reinv
+        g     = (c.revenue / prev_rev - 1) if prev_rev else float("nan")
+
+        rows.append({
+            "year":         c.year,
+            "revenue":      round(c.revenue, 4),
+            "rev_growth":   round(g * 100, 2) if math.isfinite(g) else None,
+            "ebit_margin":  round(c.ebit_margin * 100, 2),
+            "ebit":         round(ebit, 4),
+            "nopat":        round(nopat, 4),
+            "reinvestment": round(reinv, 4),
+            "fcf":          round(fcf, 4),
+            "source":       "consensus",
+        })
+        prev_rev = c.revenue
+
+    return pd.DataFrame(rows).set_index("year")
 
 
-def _converge_margin(
-    base_margin: float,
-    target_margin: float,
-    step: int,
-    horizon: int,
-) -> float:
-    """Linear convergence of EBIT margin over the horizon."""
-    if horizon <= 1:
-        return target_margin
-    alpha = (step - 1) / (horizon - 1)
-    return base_margin * (1 - alpha) + target_margin * alpha
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  EXTRAPOLATION ENGINE  (Guards 1-3 enforced per year)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _linspace(start: float, end: float, step: int, total_steps: int) -> float:
+    """Linear interpolation: step=1 -> start, step=total_steps -> end."""
+    if total_steps <= 1:
+        return end
+    alpha = (step - 1) / (total_steps - 1)
+    return start * (1 - alpha) + end * alpha
 
 
 def extrapolate_fcfs(
     consensus: list[ConsensusYear],
-    params: DCFParams,
-    firm_type: FirmType,
-    horizon: int,
-    extrapolate_from_year: int,
-    extrapolate_to_year: int,
+    params:    DCFParams,
+    from_year: int,
+    to_year:   int,
 ) -> pd.DataFrame:
     """
-    Generate FCF rows for years [extrapolate_from_year .. extrapolate_to_year].
+    Generate FCF rows for [from_year .. to_year] with all safety guards.
 
-    FCF = EBIT(1-t) + D&A - CapEx - dNWC    (Damodaran FCFF definition)
-
-    Growth decay  : last consensus rev growth → risk_free_rate
-    Margin conv.  : last consensus EBIT margin → industry_ebit_margin
-    D&A / CapEx / NWC: held at params percentages of revenue
+    Guard 1: growth linearly decays from last-consensus growth -> rf  (floor = rf)
+    Guard 2: EBIT margin linearly converges -> target_industry_margin
+    Guard 3: Reinvestment = DeltaRev / sales_to_capital
     """
-    # ── seed values from last consensus year ──────────────────────────────
-    last = max(consensus, key=lambda c: c.year)
-    # compute implied revenue growth from last two consensus points
-    second_last = sorted(consensus, key=lambda c: c.year)[-2] if len(consensus) >= 2 else None
-    if second_last:
-        seed_growth = (last.revenue / second_last.revenue) - 1
+    sorted_con  = sorted(consensus, key=lambda c: c.year)
+    last        = sorted_con[-1]
+    second_last = sorted_con[-2] if len(sorted_con) >= 2 else None
+
+    if second_last and second_last.revenue > 0:
+        seed_growth = last.revenue / second_last.revenue - 1
     else:
         seed_growth = params.risk_free_rate + 0.02
 
     seed_margin = last.ebit_margin
-    seed_rev    = last.revenue
-
-    # ── extrapolation horizon relative to consensus end ───────────────────
-    n_steps = extrapolate_to_year - extrapolate_from_year + 1
+    n_steps     = to_year - from_year + 1
 
     rows: list[dict] = []
-    prev_rev = seed_rev
+    prev_rev = last.revenue
 
-    for step, yr in enumerate(range(extrapolate_from_year, extrapolate_to_year + 1), start=1):
-        g = _decay_growth(seed_growth, params.terminal_growth, step, n_steps)
-        m = _converge_margin(seed_margin, params.industry_ebit_margin, step, n_steps)
+    for step, yr in enumerate(range(from_year, to_year + 1), start=1):
+        # Guard 1: growth decay with hard floor at rf
+        g = _linspace(seed_growth, params.risk_free_rate, step, n_steps)
+        g = max(g, params.risk_free_rate)
 
-        rev    = prev_rev * (1 + g)
-        ebit   = rev * m
-        nopat  = ebit * (1 - params.tax_rate)
-        da     = rev * params.da_pct_revenue
-        capex  = rev * params.capex_pct_revenue
-        # delta NWC = change in (NWC_pct × revenue)
-        d_nwc  = (rev - prev_rev) * params.nwc_pct_revenue
-        fcf    = nopat + da - capex - d_nwc
+        # Guard 2: margin convergence (no floor/ceiling — allows negative to converge up)
+        m = _linspace(seed_margin, params.target_industry_margin, step, n_steps)
+
+        rev   = prev_rev * (1 + g)
+        ebit  = rev * m
+        nopat = ebit * (1 - params.tax_rate)
+
+        # Guard 3
+        reinv = (rev - prev_rev) / params.sales_to_capital
+        fcf   = nopat - reinv
 
         rows.append({
-            "year":        yr,
-            "revenue":     round(rev, 3),
-            "rev_growth":  round(g * 100, 2),
-            "ebit_margin": round(m * 100, 2),
-            "ebit":        round(ebit, 3),
-            "nopat":       round(nopat, 3),
-            "da":          round(da, 3),
-            "capex":       round(capex, 3),
-            "delta_nwc":   round(d_nwc, 3),
-            "fcf":         round(fcf, 3),
-            "source":      "extrapolated",
+            "year":         yr,
+            "revenue":      round(rev, 4),
+            "rev_growth":   round(g * 100, 2),
+            "ebit_margin":  round(m * 100, 2),
+            "ebit":         round(ebit, 4),
+            "nopat":        round(nopat, 4),
+            "reinvestment": round(reinv, 4),
+            "fcf":          round(fcf, 4),
+            "source":       "extrapolated",
         })
         prev_rev = rev
 
     return pd.DataFrame(rows).set_index("year")
 
 
-def consensus_to_fcf(
-    consensus: list[ConsensusYear],
-    params: DCFParams,
-) -> pd.DataFrame:
-    """Convert consensus estimates to FCF rows (same schema as extrapolated)."""
-    rows: list[dict] = []
-    rev_prev: float | None = None
-
-    for c in sorted(consensus, key=lambda x: x.year):
-        nopat = c.ebit_margin * c.revenue * (1 - params.tax_rate)
-        d_nwc = ((c.revenue - rev_prev) * params.nwc_pct_revenue
-                 if rev_prev is not None else c.delta_nwc)
-        fcf   = nopat + c.da - c.capex - d_nwc
-        g     = (c.revenue / rev_prev - 1) if rev_prev else float("nan")
-
-        rows.append({
-            "year":        c.year,
-            "revenue":     round(c.revenue, 3),
-            "rev_growth":  round(g * 100, 2) if not math.isnan(g) else None,
-            "ebit_margin": round(c.ebit_margin * 100, 2),
-            "ebit":        round(c.ebit_margin * c.revenue, 3),
-            "nopat":       round(nopat, 3),
-            "da":          round(c.da, 3),
-            "capex":       round(c.capex, 3),
-            "delta_nwc":   round(d_nwc, 3),
-            "fcf":         round(fcf, 3),
-            "source":      "consensus",
-        })
-        rev_prev = c.revenue
-
-    return pd.DataFrame(rows).set_index("year")
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  ROLLING DCF CALCULATOR
+# 5.  ROLLING DCF CALCULATOR
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _wacc(params: DCFParams) -> float:
-    return params.risk_free_rate + params.beta * params.erp
-
-
-def _pv_stream(
-    fcf_series: pd.Series,
-    wacc: float,
-    base_year: int,
-) -> float:
-    """
-    Discount a Series of FCFs (index = year) back to base_year end.
-    Year base_year+1 is discounted 1 period, base_year+2 two periods, etc.
-    """
+def _pv_stream(fcf_series: pd.Series, wacc: float, base_year: int) -> float:
+    """Sum of PV of each FCF discounted back to base_year end."""
     total = 0.0
     for yr, fcf in fcf_series.items():
-        n = yr - base_year
+        n = int(yr) - base_year
         if n <= 0:
             continue
-        total += fcf / (1 + wacc) ** n
+        total += float(fcf) / (1 + wacc) ** n
     return total
 
 
 def _terminal_value(
-    last_fcf: float,
-    wacc: float,
-    terminal_growth: float,
-    base_year: int,
-    terminal_year: int,
+    fcf_y11:     float,
+    wacc:        float,
+    terminal_g:  float,
+    base_year:   int,
+    tv_fcf_year: int,
 ) -> float:
     """
-    Gordon-Growth TV at terminal_year, discounted back to base_year.
-    TV = FCF_terminal × (1 + g) / (WACC - g)
+    Guard 4: TV = FCF_Y11 / (WACC - rf), discounted to base_year.
+    Raises ValueError if spread <= 0.
     """
-    if wacc <= terminal_growth:
-        raise ValueError(f"WACC ({wacc:.3f}) must exceed terminal growth ({terminal_growth:.3f})")
-    tv      = last_fcf * (1 + terminal_growth) / (wacc - terminal_growth)
-    n       = terminal_year - base_year
+    spread = wacc - terminal_g
+    if spread <= 0:
+        raise ValueError(
+            f"Guard 4 violated: WACC({wacc:.4f}) <= terminal_g({terminal_g:.4f}). "
+            "Increase beta or ERP."
+        )
+    tv = fcf_y11 / spread
+    n  = tv_fcf_year - base_year
     return tv / (1 + wacc) ** n
 
 
 def calculate_rolling_targets(
-    f2025: Financials2025,
+    actuals:   Financials,
     consensus: list[ConsensusYear],
-    params: DCFParams | None = None,
-    cash_per_year: dict[int, float] | None = None,
+    params:    DCFParams | None = None,
 ) -> pd.DataFrame:
     """
     Compute year-end target prices for 2026, 2027, 2028.
 
-    Mechanics per Damodaran Rolling DCF:
-      For each valuation date T ∈ {2026, 2027, 2028}:
-        Base Cash  = Cash_{T-1} + FCF_T
-        EV         = PV(FCF_{T+1 … T+H}) + PV(TV at T+H)   discounted to T
-        Equity     = EV + Base Cash − Debt
-        Target     = Equity / Shares
-
-    Parameters
-    ----------
-    cash_per_year : optional mapping {2025: X, 2026: Y, 2027: Z}
-                    Override cumulative cash balances if known.
+    For each base_year T in {2026, 2027, 2028}:
+      Base Cash  = Cash_{T-1} + FCF_T      (rolling cash accumulation)
+      EV         = PV(FCF_{T+1..T+10}) + PV(TV at Y11)   discounted to T
+      Equity     = EV + Base Cash - Debt
+      TP         = Equity / Shares
     """
     if params is None:
         params = DCFParams()
 
-    firm_type, horizon = classify_firm(f2025)
-    wacc               = _wacc(params)
+    wacc       = params.wacc
+    terminal_g = params.terminal_growth   # Guard 4: == rf
 
-    # ── build full FCF table: consensus (2026-2028) + extrapolated ────────
-    con_df = consensus_to_fcf(consensus, params)
+    # build consensus FCF table
+    con_df = consensus_to_fcf(consensus, actuals, params)
 
-    # extrapolate from 2029 to cover the longest window needed (2028+horizon)
-    last_con_year  = max(c.year for c in consensus)
-    ext_start      = last_con_year + 1
-    ext_end        = 2028 + horizon          # worst-case terminal year
-
+    # extrapolate 2029 .. 2039 (T=2026 needs up to Y11=2037; T=2028 needs up to Y11=2039)
+    last_con_year = max(c.year for c in consensus)
     ext_df = extrapolate_fcfs(
-        consensus          = consensus,
-        params             = params,
-        firm_type          = firm_type,
-        horizon            = horizon,
-        extrapolate_from_year = ext_start,
-        extrapolate_to_year   = ext_end,
+        consensus  = consensus,
+        params     = params,
+        from_year  = last_con_year + 1,
+        to_year    = 2028 + 11,
     )
 
     all_fcf: pd.Series = pd.concat([con_df["fcf"], ext_df["fcf"]])
 
-    # ── rolling cash balances ─────────────────────────────────────────────
-    # Cash_T = Cash_{T-1} + FCF_T  (simplified; ignores dividends/buybacks)
+    # rolling cash: Cash_T = Cash_{T-1} + FCF_T
     rolling_cash: dict[int, float] = {}
-    cash_prev = cash_per_year.get(2025, f2025.cash) if cash_per_year else f2025.cash
-    for yr in sorted([c.year for c in consensus]):
+    cash_prev = actuals.cash
+    for yr in sorted(c.year for c in consensus):
         fcf_t = float(all_fcf.loc[yr])
         rolling_cash[yr] = cash_prev + fcf_t
         cash_prev = rolling_cash[yr]
 
-    # ── valuation loop ────────────────────────────────────────────────────
     results: list[dict] = []
 
-    for base_year in (2026, 2027, 2028):
-        # projection window: base_year+1 … base_year+horizon
-        proj_start   = base_year + 1
-        proj_end     = base_year + horizon
-        terminal_yr  = proj_end
+    for base_year in ROLLING_BASES:
+        proj_start  = base_year + 1
+        proj_end    = base_year + 10
+        tv_fcf_year = base_year + 11       # Guard 4: FCF at Y11
 
-        # FCFs within the projection window
         window_fcf = all_fcf[
             (all_fcf.index >= proj_start) & (all_fcf.index <= proj_end)
         ]
 
         pv_fcfs = _pv_stream(window_fcf, wacc, base_year)
 
-        last_fcf_in_window = float(all_fcf.loc[terminal_yr]) if terminal_yr in all_fcf.index else float(window_fcf.iloc[-1])
-        pv_tv   = _terminal_value(last_fcf_in_window, wacc, params.terminal_growth,
-                                  base_year, terminal_yr)
+        fcf_y11 = (float(all_fcf.loc[tv_fcf_year])
+                   if tv_fcf_year in all_fcf.index
+                   else float(all_fcf.iloc[-1]))
+        pv_tv   = _terminal_value(fcf_y11, wacc, terminal_g, base_year, tv_fcf_year)
 
         ev           = pv_fcfs + pv_tv
-        base_cash    = rolling_cash.get(base_year, f2025.cash)
-        equity_value = ev + base_cash - f2025.debt
-        target_price = equity_value / f2025.shares if f2025.shares else float("nan")
+        base_cash    = rolling_cash.get(base_year, actuals.cash)
+        equity_value = ev + base_cash - actuals.debt
+        target_price = equity_value / actuals.shares if actuals.shares > 0 else float("nan")
 
         results.append({
-            "valuation_date":  base_year,
-            "firm_type":       firm_type,
-            "horizon_yrs":     horizon,
-            "wacc_pct":        round(wacc * 100, 2),
-            "proj_window":     f"{proj_start}-{proj_end}",
-            "pv_fcfs_B":       round(pv_fcfs, 2),
-            "pv_tv_B":         round(pv_tv, 2),
-            "ev_B":            round(ev, 2),
-            "base_cash_B":     round(base_cash, 2),
-            "debt_B":          round(f2025.debt, 2),
-            "equity_B":        round(equity_value, 2),
-            "shares_B":        round(f2025.shares, 3),
-            "target_price":    round(target_price, 2),
+            "valuation_date": base_year,
+            "firm_type":      classify_firm(actuals)[0],
+            "wacc_pct":       round(wacc * 100, 2),
+            "terminal_g_pct": round(terminal_g * 100, 2),
+            "proj_window":    f"{proj_start}-{proj_end}",
+            "tv_fcf_year":    tv_fcf_year,
+            "fcf_y11":        round(fcf_y11, 4),
+            "pv_fcfs_B":      round(pv_fcfs, 3),
+            "pv_tv_B":        round(pv_tv, 3),
+            "ev_B":           round(ev, 3),
+            "base_cash_B":    round(base_cash, 3),
+            "debt_B":         round(actuals.debt, 3),
+            "equity_B":       round(equity_value, 3),
+            "shares_B":       round(actuals.shares, 4),
+            "target_price":   round(target_price, 2),
         })
 
     return pd.DataFrame(results).set_index("valuation_date")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  DIAGNOSTICS  (full FCF schedule)
+# 6.  FULL SCHEDULE (diagnostic)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_full_schedule(
+    actuals:   Financials,
     consensus: list[ConsensusYear],
-    params: DCFParams,
-    firm_type: FirmType,
-    horizon: int,
+    params:    DCFParams,
 ) -> pd.DataFrame:
-    """Return the complete FCF schedule for inspection."""
-    con_df = consensus_to_fcf(consensus, params)
+    con_df = consensus_to_fcf(consensus, actuals, params)
     ext_df = extrapolate_fcfs(
-        consensus             = consensus,
-        params                = params,
-        firm_type             = firm_type,
-        horizon               = horizon,
-        extrapolate_from_year = max(c.year for c in consensus) + 1,
-        extrapolate_to_year   = 2028 + horizon,
+        consensus  = consensus,
+        params     = params,
+        from_year  = max(c.year for c in consensus) + 1,
+        to_year    = 2028 + 11,
     )
     return pd.concat([con_df, ext_df])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6.  MOCK EXECUTION  (AAPL-proxy dummy data)
+# 7.  MOCK EXECUTION  -- extreme data (IonQ-style: 200% growth, -400% margin)
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
 
-    pd.set_option("display.float_format", "{:.2f}".format)
+    pd.set_option("display.float_format", "{:.3f}".format)
     pd.set_option("display.max_columns", 20)
-    pd.set_option("display.width", 120)
+    pd.set_option("display.width", 130)
 
-    # ── 2025 actuals snapshot ─────────────────────────────────────────────
-    aapl_2025 = Financials2025(
-        ebit_margin    = 0.318,   # 31.8 %
-        revenue_growth = 0.064,   # 6.4 %  → classified as MATURE
-        revenue        = 416.16,
-        ebit           = 132.34,
-        da             = 16.70,
-        capex          = 10.90,
-        delta_nwc      = 3.20,
-        cash           = 53.77,   # cash + ST investments
-        debt           = 97.34,
-        shares         = 15.12,   # diluted, B shares
+    # SCENARIO A: Hyper-growth, deeply unprofitable (IonQ-style)
+    ionq_actuals = Financials(
+        revenue        = 0.043,
+        ebit_margin    = -4.0,     # -400% stress test
+        revenue_growth = 2.0,      # 200% stress test
+        cash           = 0.38,
+        debt           = 0.05,
+        shares         = 0.67,
     )
-
-    # ── 2026–2028 consensus (Stockanalysis-style) ─────────────────────────
-    consensus_aapl: list[ConsensusYear] = [
-        ConsensusYear(
-            year=2026, revenue=486.77, ebit_margin=0.330,
-            da=17.50, capex=11.50, delta_nwc=3.80,
-        ),
-        ConsensusYear(
-            year=2027, revenue=528.50, ebit_margin=0.338,
-            da=18.20, capex=12.10, delta_nwc=4.10,
-        ),
-        ConsensusYear(
-            year=2028, revenue=573.00, ebit_margin=0.342,
-            da=19.00, capex=12.80, delta_nwc=4.40,
-        ),
+    ionq_consensus = [
+        ConsensusYear(year=2026, revenue=0.105, ebit_margin=-2.5),
+        ConsensusYear(year=2027, revenue=0.230, ebit_margin=-1.2),
+        ConsensusYear(year=2028, revenue=0.420, ebit_margin=-0.4),
     ]
-
-    # ── DCF parameters ────────────────────────────────────────────────────
-    params = DCFParams(
-        tax_rate               = 0.155,   # AAPL effective
-        risk_free_rate         = 0.044,
-        erp                    = 0.055,
-        beta                   = 1.24,
-        terminal_growth        = 0.025,
-        industry_ebit_margin   = 0.28,    # Tech hardware industry avg
-        da_pct_revenue         = 0.042,
-        capex_pct_revenue      = 0.026,
-        nwc_pct_revenue        = 0.018,
+    ionq_params = DCFParams(
+        risk_free_rate=0.044, erp=0.055, beta=2.10,
+        tax_rate=0.0, target_industry_margin=0.15, sales_to_capital=0.8,
     )
 
-    # ── classify ──────────────────────────────────────────────────────────
-    firm_type, horizon = classify_firm(aapl_2025)
-    wacc = _wacc(params)
+    # SCENARIO B: AAPL-proxy (mature, profitable)
+    aapl_actuals = Financials(
+        revenue=416.16, ebit_margin=0.318, revenue_growth=0.064,
+        cash=53.77, debt=97.34, shares=15.12,
+    )
+    aapl_consensus = [
+        ConsensusYear(year=2026, revenue=486.77, ebit_margin=0.330),
+        ConsensusYear(year=2027, revenue=528.50, ebit_margin=0.338),
+        ConsensusYear(year=2028, revenue=573.00, ebit_margin=0.342),
+    ]
+    aapl_params = DCFParams(
+        risk_free_rate=0.044, erp=0.055, beta=1.24,
+        tax_rate=0.155, target_industry_margin=0.28, sales_to_capital=2.0,
+    )
 
-    print("=" * 65)
-    print("  ROLLING DCF  -  AAPL-proxy  (Damodaran methodology)")
-    print("=" * 65)
-    print(f"  Firm type   : {firm_type.upper()}   |   Horizon : {horizon} yrs")
-    print(f"  WACC        : {wacc*100:.2f}%  "
-          f"(rf {params.risk_free_rate*100:.1f}% + b{params.beta} x ERP {params.erp*100:.1f}%)")
-    print(f"  Terminal g  : {params.terminal_growth*100:.1f}%")
-    print()
+    for name, actuals, consensus, params in [
+        ("IonQ-style  [STRESS: 200% growth, -400% margin]", ionq_actuals, ionq_consensus, ionq_params),
+        ("AAPL-proxy  [NORMAL: 6% growth, 32% margin]",     aapl_actuals, aapl_consensus, aapl_params),
+    ]:
+        firm_type, _ = classify_firm(actuals)
+        print("=" * 78)
+        print(f"  {name}")
+        print("=" * 78)
+        print(f"  Firm type    : {firm_type.upper()}")
+        print(f"  WACC         : {params.wacc*100:.2f}%  "
+              f"(rf {params.risk_free_rate*100:.1f}% + "
+              f"b{params.beta} x ERP {params.erp*100:.1f}%)")
+        print(f"  Terminal g   : {params.terminal_growth*100:.2f}%  [Guard 4: = rf]")
+        print(f"  Spread       : {(params.wacc-params.risk_free_rate)*100:.2f}%  [> 0 enforced]")
+        print(f"  Ind. margin  : {params.target_industry_margin*100:.1f}%  [Guard 2 target]")
+        print(f"  S/Capital    : {params.sales_to_capital}  [Guard 3]")
+        print()
 
-    # ── full FCF schedule ─────────────────────────────────────────────────
-    schedule = build_full_schedule(consensus_aapl, params, firm_type, horizon)
-    print("-- FCF Schedule (B$) " + "-" * 45)
-    display_cols = ["revenue", "rev_growth", "ebit_margin", "nopat", "da", "capex", "fcf", "source"]
-    print(schedule[display_cols].to_string())
-    print()
+        sched = build_full_schedule(actuals, consensus, params)
+        cols  = ["revenue", "rev_growth", "ebit_margin", "nopat", "reinvestment", "fcf", "source"]
+        print(sched[cols].to_string())
+        print()
 
-    # ── rolling target prices ─────────────────────────────────────────────
-    targets = calculate_rolling_targets(aapl_2025, consensus_aapl, params)
-    print("-- Rolling Target Prices " + "-" * 41)
-    print(targets.to_string())
-    print()
-
-    # ── per-year summary ──────────────────────────────────────────────────
-    print("-- Target Price Summary " + "-" * 42)
-    for yr, row in targets.iterrows():
-        print(f"  Year-End {yr} -> ${row['target_price']:.2f}  "
-              f"(EV ${row['ev_B']:.1f}B | Cash ${row['base_cash_B']:.1f}B "
-              f"| Debt ${row['debt_B']:.1f}B | Equity ${row['equity_B']:.1f}B)")
+        targets = calculate_rolling_targets(actuals, consensus, params)
+        print("  Rolling Target Prices:")
+        for yr, row in targets.iterrows():
+            print(f"    {yr}E -> ${row['target_price']:.2f}  "
+                  f"| EV ${row['ev_B']:.3f}B "
+                  f"| PV(FCF) ${row['pv_fcfs_B']:.3f}B "
+                  f"| PV(TV) ${row['pv_tv_B']:.3f}B "
+                  f"| Cash ${row['base_cash_B']:.3f}B")
+        print()

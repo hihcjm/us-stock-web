@@ -858,8 +858,7 @@
               <th>매출성장</th>
               <th>EBIT 마진</th>
               <th>NOPAT</th>
-              <th>D&amp;A</th>
-              <th>CapEx</th>
+              <th>재투자</th>
               <th>FCF</th>
               <th>구분</th>
             </tr>
@@ -872,8 +871,7 @@
             <td>{% if s.rev_growth is not none %}{{ s.rev_growth }}%{% else %}—{% endif %}</td>
             <td>{{ s.ebit_margin }}%</td>
             <td>{{ s.nopat }}</td>
-            <td>{{ s.da }}</td>
-            <td>{{ s.capex }}</td>
+            <td>{{ s.reinvestment }}</td>
             <td style="font-weight:{% if s.source=='consensus' %}700{% else %}400{% endif %};">
               {{ s.fcf }}
             </td>
@@ -893,9 +891,11 @@
     {% endif %}
 
     <p style="padding:10px 20px 14px;color:#a0aec0;font-size:11px;">
-      Damodaran Rolling DCF: 각 연도말 기준 잔여 호라이즌 FCF + 터미널 밸류 현재가치 합산.
-      컨센서스 이후 매출 성장률은 rf 수준으로 선형 수렴, EBIT 마진은 업종 평균으로 수렴.
-      현금·부채·발행주식수는 Yahoo Finance 기준.
+      Damodaran Rolling DCF (Safety-Guarded v2):
+      재투자 = 매출 증분 ÷ Sales-to-Capital({{ rd.stc }}) [Guard 3] ·
+      성장률 → rf 선형 수렴 [Guard 1] ·
+      EBIT 마진 → {{ rd.industry_margin }}% 수렴 [Guard 2] ·
+      TV = FCF<sub>Y11</sub> ÷ (WACC − rf) [Guard 4]
     </p>
   </div>
   {% elif result.rdcf and result.rdcf.error %}
