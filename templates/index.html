@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>미국 주식 밸류에이션{% if result and not result.error %} — {{ result.ticker }}{% endif %}</title>
+<title>미국주식 밸류에이션 (made by hocheol){% if result and not result.error %} — {{ result.ticker }}{% endif %}</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -179,41 +179,87 @@
   .financial-table tr:hover td { background: #f7fafc; }
   .financial-table tr:last-child td { border-bottom: none; }
 
-  /* ── 밴드 ── */
+  /* ── 밴드 (차트형) ── */
   .band-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-    gap: 16px;
-    padding: 16px 20px;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 20px;
+    padding: 20px;
   }
   .band-card {
-    background: #f7fafc;
-    border-radius: 8px;
-    padding: 14px 16px;
+    background: #fff;
+    border-radius: 12px;
     border: 1px solid #e2e8f0;
+    padding: 18px 20px 14px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.06);
   }
-  .band-card h3 { font-size: 14px; font-weight: 700; color: #2d3748; margin-bottom: 10px; }
-  .band-row { display: flex; justify-content: space-between; font-size: 12px;
-              padding: 3px 0; border-bottom: 1px solid #edf2f7; }
-  .band-row:last-child { border-bottom: none; }
-  .band-row .bk  { color: #718096; }
-  .band-row .bv  { font-weight: 600; }
-  .band-bar-wrap { margin: 10px 0; position: relative; height: 6px;
-                   background: linear-gradient(to right, #bee3f8, #3182ce, #e53e3e);
-                   border-radius: 3px; }
-  .band-marker { position: absolute; top: -4px; width: 14px; height: 14px;
-                 background: #fff; border: 2px solid #2d3748;
-                 border-radius: 50%; transform: translateX(-50%); }
+  /* 상단: 지표명 + 등급 배지 */
+  .band-card-header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 14px;
+  }
+  .band-card-header h3 { font-size: 16px; font-weight: 800; color: #1a202c; }
+  .band-card-header .curr-val {
+    font-size: 12px; color: #718096; font-weight: 500;
+  }
+  /* 예상주가 + 괴리율 */
+  .band-theory-block {
+    background: #f7fafc; border-radius: 8px;
+    padding: 10px 14px; margin-bottom: 14px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .band-theory-block .theory-label { font-size: 11px; color: #718096; }
+  .band-theory-block .theory-price { font-size: 22px; font-weight: 900; color: #1a365d; }
+  .band-theory-block .theory-diff  { font-size: 13px; font-weight: 700; }
+  .theory-up   { color: #38a169; }
+  .theory-down { color: #e53e3e; }
+  /* 수직 밴드 바 */
+  .band-bar-section { margin: 4px 0 12px; }
+  .band-bar-track {
+    position: relative; height: 10px; border-radius: 5px;
+    background: linear-gradient(to right,
+      #ebf8ff 0%, #bee3f8 20%, #90cdf4 40%,
+      #63b3ed 50%, #f6ad55 65%, #fc8181 80%, #fc5454 100%);
+    margin: 18px 0 6px;
+  }
+  .band-bar-tick {
+    position: absolute; top: -16px;
+    transform: translateX(-50%);
+    font-size: 10px; color: #718096; white-space: nowrap;
+  }
+  .band-bar-tick-line {
+    position: absolute; bottom: -4px;
+    transform: translateX(-50%);
+    width: 1px; height: 18px; background: #cbd5e0;
+  }
+  .band-bar-marker {
+    position: absolute; top: 50%;
+    transform: translate(-50%, -50%);
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #fff; border: 3px solid #2d3748;
+    box-shadow: 0 1px 4px rgba(0,0,0,.25);
+    z-index: 2;
+  }
+  .band-bar-label-row {
+    display: flex; justify-content: space-between;
+    font-size: 10px; color: #a0aec0; margin-top: 4px;
+  }
+  /* σ 테이블 */
+  .sigma-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+  .sigma-table td { padding: 3px 6px; }
+  .sigma-table td:last-child { text-align: right; font-weight: 600; }
+  .sigma-table tr.sigma-avg td { background: #ebf4ff; color: #2b6cb0; font-weight: 700; border-radius: 4px; }
+  .sigma-table tr.sigma-curr td { background: #fffbeb; color: #b7791f; }
+  /* 등급 배지 */
   .grade-chip {
-    display: inline-block; padding: 2px 8px; border-radius: 10px;
-    font-size: 11px; font-weight: 700; margin-top: 4px;
+    display: inline-block; padding: 3px 10px; border-radius: 10px;
+    font-size: 11px; font-weight: 700;
   }
   .grade-Undervalued, .grade-Significantly-Undervalued { background:#c6f6d5; color:#276749; }
   .grade-Fair        { background:#fefcbf; color:#744210; }
   .grade-Overvalued, .grade-Significantly-Overvalued  { background:#fed7d7; color:#9b2335; }
-  .theory-row { font-size: 12px; margin-top: 6px; color: #4a5568; }
-  .theory-row .up   { color: #38a169; font-weight: 700; }
-  .theory-row .down { color: #e53e3e; font-weight: 700; }
+
+  @media (max-width:700px) { .band-grid { grid-template-columns: 1fr; } }
 
   /* ── DCF ── */
   .val-table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -318,8 +364,8 @@
 
 <header class="site-header">
   <div>
-    <h1>🇺🇸 미국 주식 밸류에이션</h1>
-    <p>DCF · 상대가치 · 애널리스트 컨센서스 · Yahoo Finance 데이터</p>
+    <h1>🇺🇸 미국주식 밸류에이션</h1>
+    <p>DCF · 상대가치 · 애널리스트 컨센서스 · Yahoo Finance &nbsp;|&nbsp; made by hocheol</p>
   </div>
 </header>
 
@@ -607,63 +653,137 @@
     </p>
   </div>
 
-  {# ── 밸류에이션 밴드 ── #}
+  {# ── 밸류에이션 밴드 (차트형) ── #}
   {% if result.band %}
+  {% set grade_ko = {
+    'Significantly Undervalued': '매우 저평가',
+    'Undervalued': '저평가',
+    'Fair': '적정',
+    'Overvalued': '고평가',
+    'Significantly Overvalued': '매우 고평가'
+  } %}
   <div class="card">
-    <div class="card-header">📈 상대가치 밴드 (과거 평균 ± 표준편차)</div>
+    <div class="card-header">📈 상대가치 밴드 &nbsp;<span style="font-size:11px;font-weight:400;color:#718096;">과거 평균 배수 기준 예상주가 · 현재 주가 위치</span></div>
     <div class="band-grid">
-      {% for b in result.band %}
-        {% if b.error %}
-        <div class="band-card" style="opacity:0.5;">
+    {% for b in result.band %}
+
+      {# ── 에러 카드 ── #}
+      {% if b.error %}
+      <div class="band-card" style="opacity:.5;">
+        <div class="band-card-header"><h3>{{ b.metric }}</h3></div>
+        <p style="font-size:12px;color:#a0aec0;">{{ b.error }}</p>
+      </div>
+
+      {# ── 정상 카드 ── #}
+      {% else %}
+      {% set m2s  = b.bands.m2s %}
+      {% set p2s  = b.bands.p2s %}
+      {% set rng  = p2s - m2s if p2s > m2s else 1 %}
+
+      {# 현재 배수 위치 % (0~100) #}
+      {% if b.fwd_val %}
+        {% set cur_pct = ((b.fwd_val - m2s) / rng * 100) | round(1) %}
+        {% set cur_pct = [0, [cur_pct, 100] | min] | max %}
+      {% else %}
+        {% set cur_pct = 50 %}
+      {% endif %}
+
+      {# σ 눈금 위치 % #}
+      {% set pct_m1s = ((b.bands.m1s - m2s) / rng * 100) | round(1) %}
+      {% set pct_avg = ((b.bands.avg  - m2s) / rng * 100) | round(1) %}
+      {% set pct_p1s = ((b.bands.p1s  - m2s) / rng * 100) | round(1) %}
+
+      <div class="band-card">
+
+        {# ── 헤더: 지표명 + 등급 ── #}
+        <div class="band-card-header">
           <h3>{{ b.metric }}</h3>
-          <p style="font-size:12px;color:#a0aec0;">{{ b.error }}</p>
-        </div>
-        {% else %}
-        <div class="band-card">
-          <h3>{{ b.metric }}
-            {% if b.fwd_val %}
-            <span style="font-size:12px;font-weight:400;color:#718096;"> 현재: {{ b.fwd_val }}</span>
-            {% endif %}
-          </h3>
-          <div class="band-row"><span class="bk">과거 평균</span><span class="bv">{{ b.hist_avg }}</span></div>
-          <div class="band-row"><span class="bk">표준편차</span><span class="bv">± {{ b.hist_std }}</span></div>
-          <div class="band-row"><span class="bk">-2σ</span><span class="bv">{{ b.bands.m2s }}</span></div>
-          <div class="band-row"><span class="bk">-1σ</span><span class="bv">{{ b.bands.m1s }}</span></div>
-          <div class="band-row" style="font-weight:700;background:#f0f4f8;">
-            <span class="bk">평균</span><span class="bv">{{ b.bands.avg }}</span>
-          </div>
-          <div class="band-row"><span class="bk">+1σ</span><span class="bv">{{ b.bands.p1s }}</span></div>
-          <div class="band-row"><span class="bk">+2σ</span><span class="bv">{{ b.bands.p2s }}</span></div>
           {% if b.grade_fwd %}
-          <div style="margin-top:8px;">
-            {% set grade_ko_map = {
-              'Significantly Undervalued': '매우 저평가',
-              'Undervalued': '저평가',
-              'Fair': '적정',
-              'Overvalued': '고평가',
-              'Significantly Overvalued': '매우 고평가'
-            } %}
-            <span class="grade-chip grade-{{ b.grade_fwd | replace(' ', '-') }}">
-              {{ grade_ko_map[b.grade_fwd] if b.grade_fwd in grade_ko_map else b.grade_fwd }}
-            </span>
-          </div>
+          <span class="grade-chip grade-{{ b.grade_fwd | replace(' ', '-') }}">
+            {{ grade_ko[b.grade_fwd] if b.grade_fwd in grade_ko else b.grade_fwd }}
+          </span>
           {% endif %}
-          {% if b.theory_fwd %}
-          <div class="theory-row">
-            이론 주가 ({{ b.base_label }}): <strong>${{ b.theory_fwd }}</strong>
+        </div>
+
+        {# ── 예상주가 + 괴리율 (PEG는 이론주가 없음) ── #}
+        {% if b.theory_fwd %}
+        <div class="band-theory-block">
+          <div>
+            <div class="theory-label">과거 평균 {{ b.metric }} 기준 예상주가</div>
+            <div class="theory-price">${{ b.theory_fwd }}</div>
+            <div style="font-size:11px;color:#718096;margin-top:2px;">기준: {{ b.base_label }}</div>
+          </div>
+          <div style="text-align:right;">
+            <div class="theory-label" style="margin-bottom:4px;">현재가 대비 괴리율</div>
             {% if b.diff_pct_fwd %}
-            <span class="{% if b.diff_pct_fwd[0] == '+' %}up{% else %}down{% endif %}">
-              ({{ b.diff_pct_fwd }}%)
-            </span>
+            <div class="theory-diff {% if b.diff_pct_fwd[0] == '+' %}theory-up{% else %}theory-down{% endif %}">
+              {% if b.diff_pct_fwd[0] == '+' %}▲{% else %}▼{% endif %}
+              {{ b.diff_pct_fwd }}%
+            </div>
+            <div style="font-size:11px;color:#718096;margin-top:2px;">
+              {{ b.diff_fwd }}
+            </div>
             {% endif %}
           </div>
-          {% endif %}
         </div>
         {% endif %}
-      {% endfor %}
+
+        {# ── 수평 밴드 바 ── #}
+        <div class="band-bar-section">
+          <div class="band-bar-track">
+            {# σ 눈금선 + 라벨 #}
+            <span class="band-bar-tick" style="left:0%;">-2σ</span>
+            <span class="band-bar-tick-line" style="left:0%;"></span>
+
+            <span class="band-bar-tick" style="left:{{ pct_m1s }}%;">-1σ</span>
+            <span class="band-bar-tick-line" style="left:{{ pct_m1s }}%;"></span>
+
+            <span class="band-bar-tick" style="left:{{ pct_avg }}%;font-weight:700;color:#2b6cb0;">μ</span>
+            <span class="band-bar-tick-line" style="left:{{ pct_avg }}%;background:#2b6cb0;"></span>
+
+            <span class="band-bar-tick" style="left:{{ pct_p1s }}%;">+1σ</span>
+            <span class="band-bar-tick-line" style="left:{{ pct_p1s }}%;"></span>
+
+            <span class="band-bar-tick" style="left:100%;">+2σ</span>
+            <span class="band-bar-tick-line" style="left:100%;"></span>
+
+            {# 현재 배수 마커 #}
+            {% if b.fwd_val %}
+            <div class="band-bar-marker" style="left:{{ cur_pct }}%;"
+                 title="현재 {{ b.metric }}: {{ b.fwd_val }}"></div>
+            {% endif %}
+          </div>
+          <div class="band-bar-label-row">
+            <span>{{ m2s }}</span>
+            <span style="color:#2b6cb0;font-weight:600;">{{ b.bands.avg }}</span>
+            <span>{{ p2s }}</span>
+          </div>
+        </div>
+
+        {# ── σ 수치 테이블 ── #}
+        <table class="sigma-table">
+          <tr><td style="color:#a0aec0;">-2σ</td><td>{{ b.bands.m2s }}</td>
+              <td style="color:#a0aec0;">+1σ</td><td>{{ b.bands.p1s }}</td></tr>
+          <tr><td style="color:#718096;">-1σ</td><td>{{ b.bands.m1s }}</td>
+              <td style="color:#718096;">+2σ</td><td>{{ b.bands.p2s }}</td></tr>
+          <tr class="sigma-avg">
+            <td>평균(μ)</td><td>{{ b.hist_avg }}</td>
+            <td>표준편차</td><td>± {{ b.hist_std }}</td>
+          </tr>
+          {% if b.fwd_val %}
+          <tr class="sigma-curr">
+            <td>현재 {{ b.metric }}</td><td>{{ b.fwd_val }}</td>
+            <td>과거 데이터</td><td>{{ b.hist_vals | length }}개년</td>
+          </tr>
+          {% endif %}
+        </table>
+
+      </div>
+      {% endif %}
+    {% endfor %}
     </div>
-    <p style="padding:6px 20px 12px;color:#a0aec0;font-size:11px;">
-      과거 주가 배수 기준 밴드 (현재 주가 적용). 적자(EPS &lt; 0) 연도는 계산에서 제외됩니다.
+    <p style="padding:4px 20px 14px;color:#a0aec0;font-size:11px;">
+      예상주가 = 과거 평균 배수 × Forward 지표 (EPS·BPS·SPS). 적자 연도 제외. ● 마커 = 현재 배수 위치.
     </p>
   </div>
   {% endif %}
