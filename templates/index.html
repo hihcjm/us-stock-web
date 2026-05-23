@@ -1,13 +1,13 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ko">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>US Stock Valuation{% if result and not result.error %} — {{ result.ticker }}{% endif %}</title>
+<title>미국 주식 밸류에이션{% if result and not result.error %} — {{ result.ticker }}{% endif %}</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans KR', sans-serif;
     background: #f0f4f8;
     color: #1a202c;
     min-height: 100vh;
@@ -264,17 +264,17 @@
 
 <header class="site-header">
   <div>
-    <h1>🇺🇸 US Stock Valuation</h1>
-    <p>DCF · Relative Valuation · Analyst Consensus · Yahoo Finance Data</p>
+    <h1>🇺🇸 미국 주식 밸류에이션</h1>
+    <p>DCF · 상대가치 · 애널리스트 컨센서스 · Yahoo Finance 데이터</p>
   </div>
 </header>
 
 <div class="search-wrap">
   <form method="POST" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
     <input type="text" name="ticker" value="{{ ticker }}"
-           placeholder="e.g. AAPL, NVDA, MSFT" autocomplete="off" autofocus>
-    <button type="submit">Analyze</button>
-    <span class="hint">Enter a US stock ticker symbol</span>
+           placeholder="예: AAPL, NVDA, MSFT" autocomplete="off" autofocus>
+    <button type="submit">분석</button>
+    <span class="hint">미국 주식 티커를 입력하세요</span>
   </form>
 </div>
 
@@ -292,24 +292,24 @@
     <div class="price-block">
       <div class="price">{{ result.price }}</div>
       {% if result.w52_low and result.w52_high %}
-      <div class="w52">52W: ${{ result.w52_low }} – ${{ result.w52_high }}</div>
+      <div class="w52">52주 범위: ${{ result.w52_low }} – ${{ result.w52_high }}</div>
       {% endif %}
     </div>
   </div>
 
   {# ── KPI 카드 ── #}
   <div class="card">
-    <div class="card-header">📊 Key Metrics</div>
+    <div class="card-header">📊 주요 지표</div>
     <div class="kpi-grid">
       {% if result.est.trailing_pe %}
       <div class="kpi-item">
-        <div class="kpi-label">Trailing P/E</div>
+        <div class="kpi-label">PER (Trailing)</div>
         <div class="kpi-val">{{ result.est.trailing_pe | round(1) }}x</div>
       </div>
       {% endif %}
       {% if result.est.fwd_pe %}
       <div class="kpi-item">
-        <div class="kpi-label">Forward P/E</div>
+        <div class="kpi-label">PER (Forward)</div>
         <div class="kpi-val">{{ result.est.fwd_pe | round(1) }}x</div>
       </div>
       {% endif %}
@@ -321,19 +321,19 @@
       {% endif %}
       {% if result.est.psr_trailing %}
       <div class="kpi-item">
-        <div class="kpi-label">P/S</div>
+        <div class="kpi-label">PSR</div>
         <div class="kpi-val">{{ result.est.psr_trailing | round(1) }}x</div>
       </div>
       {% endif %}
       {% if result.beta %}
       <div class="kpi-item">
-        <div class="kpi-label">Beta</div>
+        <div class="kpi-label">베타</div>
         <div class="kpi-val">{{ result.beta }}</div>
       </div>
       {% endif %}
       {% if result.market_cap %}
       <div class="kpi-item">
-        <div class="kpi-label">Mkt Cap</div>
+        <div class="kpi-label">시가총액</div>
         <div class="kpi-val">${{ result.market_cap }}B</div>
       </div>
       {% endif %}
@@ -351,15 +351,15 @@
       {% endif %}
       {% if result.de_ratio %}
       <div class="kpi-item">
-        <div class="kpi-label">Debt/Equity</div>
+        <div class="kpi-label">부채비율</div>
         <div class="kpi-val">{{ result.de_ratio | round(1) }}%</div>
       </div>
       {% endif %}
       {% if result.div_yield %}
       <div class="kpi-item">
-        <div class="kpi-label">Div Yield</div>
+        <div class="kpi-label">배당수익률</div>
         <div class="kpi-val">{{ result.div_yield }}%</div>
-        {% if result.div_rate %}<div class="kpi-sub">${{ result.div_rate }}/yr</div>{% endif %}
+        {% if result.div_rate %}<div class="kpi-sub">${{ result.div_rate }}/년</div>{% endif %}
       </div>
       {% endif %}
     </div>
@@ -368,37 +368,37 @@
   {# ── 애널리스트 섹션 ── #}
   {% if result.est.target_mean or result.est.curr_yr_eps %}
   <div class="card">
-    <div class="card-header">🎯 Analyst Consensus</div>
+    <div class="card-header">🎯 애널리스트 컨센서스</div>
     <div class="analyst-grid">
 
       {# 목표가 #}
       {% if result.est.target_mean %}
       <div class="analyst-box">
-        <h4>Price Target ({{ result.est.n_analysts }} analysts)</h4>
+        <h4>목표주가 (애널리스트 {{ result.est.n_analysts }}명)</h4>
         <div class="tp-row">
-          <span class="label">Mean</span>
+          <span class="label">평균</span>
           <span class="value {% if result.est.target_mean > (result.est.price or 0) %}up{% else %}down{% endif %}">
             ${{ result.est.target_mean | round(2) }}
           </span>
         </div>
         {% if result.est.target_median %}
         <div class="tp-row">
-          <span class="label">Median</span>
+          <span class="label">중앙값</span>
           <span class="value">${{ result.est.target_median | round(2) }}</span>
         </div>
         {% endif %}
         <div class="tp-row">
-          <span class="label">High</span>
+          <span class="label">최고</span>
           <span class="value up">${{ result.est.target_high }}</span>
         </div>
         <div class="tp-row">
-          <span class="label">Low</span>
+          <span class="label">최저</span>
           <span class="value down">${{ result.est.target_low }}</span>
         </div>
         {% if result.est.price and result.est.target_mean %}
         {% set upside = ((result.est.target_mean - result.est.price) / result.est.price * 100) | round(1) %}
         <div class="tp-row" style="margin-top:8px; border-top:1px solid #e2e8f0; padding-top:6px;">
-          <span class="label">Upside (mean)</span>
+          <span class="label">상승여력 (평균)</span>
           <span class="value {% if upside > 0 %}up{% else %}down{% endif %}">{{ upside }}%</span>
         </div>
         {% endif %}
@@ -414,15 +414,15 @@
 
       {# EPS / Revenue 추정 #}
       <div class="analyst-box">
-        <h4>Earnings &amp; Revenue Estimates</h4>
+        <h4>EPS · 매출 추정치</h4>
         <table class="est-table">
           <thead>
-            <tr><th>Period</th><th>EPS Est.</th><th>Growth</th><th>Rev Est.</th></tr>
+            <tr><th>기간</th><th>EPS 추정</th><th>성장률</th><th>매출 추정</th></tr>
           </thead>
           <tbody>
             {% if result.est.curr_yr_eps %}
             <tr>
-              <td><span class="tag-curr">CY</span></td>
+              <td><span class="tag-curr">당기</span></td>
               <td>${{ result.est.curr_yr_eps | round(2) }}
                 {% if result.est.curr_yr_eps_low and result.est.curr_yr_eps_high %}
                 <span style="font-size:10px;color:#a0aec0;">
@@ -438,7 +438,7 @@
             {% endif %}
             {% if result.est.next_yr_eps %}
             <tr>
-              <td><span class="tag-next">+1Y</span></td>
+              <td><span class="tag-next">+1년</span></td>
               <td>${{ result.est.next_yr_eps | round(2) }}
                 {% if result.est.next_yr_eps_low and result.est.next_yr_eps_high %}
                 <span style="font-size:10px;color:#a0aec0;">
@@ -469,19 +469,19 @@
 
   {# ── 재무제표 히스토리 ── #}
   <div class="card">
-    <div class="card-header">📋 Annual Financials (Yahoo Finance)</div>
+    <div class="card-header">📋 연간 재무제표 (Yahoo Finance)</div>
     <div style="padding:12px 20px; overflow-x:auto;">
       {{ result.raw_table | safe }}
     </div>
     <p style="padding:6px 20px 12px; color:#a0aec0; font-size:11px;">
-      Units: Revenue / Income / CF in B$ (billions USD) · EPS / BPS in $ per share · Margins in %
+      단위: 매출·이익·현금흐름은 B$(십억 달러) · EPS·BPS는 달러/주 · 마진은 %
     </p>
   </div>
 
   {# ── 밸류에이션 밴드 ── #}
   {% if result.band %}
   <div class="card">
-    <div class="card-header">📈 Relative Valuation Bands (Historical Average ± σ)</div>
+    <div class="card-header">📈 상대가치 밴드 (과거 평균 ± 표준편차)</div>
     <div class="band-grid">
       {% for b in result.band %}
         {% if b.error %}
@@ -493,26 +493,35 @@
         <div class="band-card">
           <h3>{{ b.metric }}
             {% if b.fwd_val %}
-            <span style="font-size:12px;font-weight:400;color:#718096;"> Current: {{ b.fwd_val }}</span>
+            <span style="font-size:12px;font-weight:400;color:#718096;"> 현재: {{ b.fwd_val }}</span>
             {% endif %}
           </h3>
-          <div class="band-row"><span class="bk">Hist. Avg</span><span class="bv">{{ b.hist_avg }}</span></div>
-          <div class="band-row"><span class="bk">Hist. Std</span><span class="bv">± {{ b.hist_std }}</span></div>
+          <div class="band-row"><span class="bk">과거 평균</span><span class="bv">{{ b.hist_avg }}</span></div>
+          <div class="band-row"><span class="bk">표준편차</span><span class="bv">± {{ b.hist_std }}</span></div>
           <div class="band-row"><span class="bk">-2σ</span><span class="bv">{{ b.bands.m2s }}</span></div>
           <div class="band-row"><span class="bk">-1σ</span><span class="bv">{{ b.bands.m1s }}</span></div>
           <div class="band-row" style="font-weight:700;background:#f0f4f8;">
-            <span class="bk">Avg</span><span class="bv">{{ b.bands.avg }}</span>
+            <span class="bk">평균</span><span class="bv">{{ b.bands.avg }}</span>
           </div>
           <div class="band-row"><span class="bk">+1σ</span><span class="bv">{{ b.bands.p1s }}</span></div>
           <div class="band-row"><span class="bk">+2σ</span><span class="bv">{{ b.bands.p2s }}</span></div>
           {% if b.grade_fwd %}
           <div style="margin-top:8px;">
-            <span class="grade-chip grade-{{ b.grade_fwd | replace(' ', '-') }}">{{ b.grade_fwd }}</span>
+            {% set grade_ko_map = {
+              'Significantly Undervalued': '매우 저평가',
+              'Undervalued': '저평가',
+              'Fair': '적정',
+              'Overvalued': '고평가',
+              'Significantly Overvalued': '매우 고평가'
+            } %}
+            <span class="grade-chip grade-{{ b.grade_fwd | replace(' ', '-') }}">
+              {{ grade_ko_map[b.grade_fwd] if b.grade_fwd in grade_ko_map else b.grade_fwd }}
+            </span>
           </div>
           {% endif %}
           {% if b.theory_fwd %}
           <div class="theory-row">
-            Implied Price ({{ b.base_label }}): <strong>${{ b.theory_fwd }}</strong>
+            이론 주가 ({{ b.base_label }}): <strong>${{ b.theory_fwd }}</strong>
             {% if b.diff_pct_fwd %}
             <span class="{% if b.diff_pct_fwd[0] == '+' %}up{% else %}down{% endif %}">
               ({{ b.diff_pct_fwd }}%)
@@ -525,7 +534,7 @@
       {% endfor %}
     </div>
     <p style="padding:6px 20px 12px;color:#a0aec0;font-size:11px;">
-      Bands based on historical multiples using current stock price as basis. Negative-EPS years excluded.
+      과거 주가 배수 기준 밴드 (현재 주가 적용). 적자(EPS &lt; 0) 연도는 계산에서 제외됩니다.
     </p>
   </div>
   {% endif %}
@@ -533,7 +542,7 @@
   {# ── DCF ── #}
   {% if result.dcf %}
   <div class="card">
-    <div class="card-header">💰 DCF Valuation (FCF-based, 3-Year Projection)</div>
+    <div class="card-header">💰 DCF 적정주가 (잉여현금흐름 기반 · 3개년 추정)</div>
 
     {% if result.dcf.error %}
     <p style="padding:16px;color:#e53e3e;">{{ result.dcf.error }}</p>
@@ -542,22 +551,22 @@
     {# FCF 히스토리 #}
     {% if result.dcf.hist_fcf %}
     <div style="padding:12px 20px 4px; font-size:12px; color:#4a5568;">
-      <strong>Historical FCF</strong> (Operating CF − Capex, used for margin average)
-      &nbsp;|&nbsp; Shares: <strong>{{ result.dcf.shares }}B</strong>
+      <strong>과거 잉여현금흐름 (FCF)</strong> (영업활동CF − CAPEX · 마진 평균 산출에 사용)
+      &nbsp;|&nbsp; 발행주식수: <strong>{{ result.dcf.shares }}B주</strong>
       <div style="overflow-x:auto; margin-top:8px;">
         <table class="fcf-hist-table">
           <thead><tr>
-            <th style="text-align:left;">Year</th>
-            <th>Op CF (B$)</th>
-            <th>Capex (B$)</th>
+            <th style="text-align:left;">연도</th>
+            <th>영업활동CF (B$)</th>
+            <th>CAPEX (B$)</th>
             <th>FCF (B$)</th>
-            <th>FCF Margin</th>
-            <th>Source</th>
+            <th>FCF 마진</th>
+            <th>출처</th>
           </tr></thead>
           <tbody>
           {% for h in result.dcf.hist_fcf %}
           <tr class="{% if h.excluded %}excluded-row{% endif %}">
-            <td>{{ h.year }}{% if h.excluded %} <span style="color:#e53e3e;font-size:10px;">excluded</span>{% endif %}</td>
+            <td>{{ h.year }}{% if h.excluded %} <span style="color:#e53e3e;font-size:10px;">제외</span>{% endif %}</td>
             <td>{% if h.op_cf %}{{ h.op_cf }}{% else %}-{% endif %}</td>
             <td>{% if h.capex %}{{ h.capex }}{% else %}-{% endif %}</td>
             <td class="{% if h.fcf < 0 %}neg{% endif %}">{{ h.fcf }}</td>
@@ -582,29 +591,29 @@
         </thead>
         <tbody>
           <tr>
-            <td>Est. FCF (B$)</td>
+            <td>추정 FCF (B$)</td>
             {% for row in result.dcf.pv_fcfs %}<td>${{ row.fcf }}</td>{% endfor %}
           </tr>
           <tr>
-            <td>PV of FCF (B$)</td>
+            <td>FCF 현재가치 (B$)</td>
             {% for row in result.dcf.pv_fcfs %}<td>${{ row.pv }}</td>{% endfor %}
           </tr>
           <tr>
-            <td>PV of Terminal Value (B$)</td>
+            <td>터미널 밸류 현재가치 (B$)</td>
             {% for row in result.dcf.pv_fcfs %}<td>${{ row.pv_tv }}</td>{% endfor %}
           </tr>
           <tr>
-            <td>Total Intrinsic Value (B$)</td>
+            <td>기업 내재가치 합계 (B$)</td>
             {% for row in result.dcf.pv_fcfs %}<td>${{ row.total_pv }}</td>{% endfor %}
           </tr>
           <tr>
-            <td><strong>Fair Value / Share</strong></td>
+            <td><strong>주당 적정가치</strong></td>
             {% for row in result.dcf.pv_fcfs %}
             <td><span class="fair-val">{{ row.fair_value }}</span></td>
             {% endfor %}
           </tr>
           <tr>
-            <td>vs. Current Price</td>
+            <td>현재가 대비</td>
             {% for row in result.dcf.pv_fcfs %}
             <td>
               {% if row.diff %}
@@ -619,11 +628,11 @@
       </table>
     </div>
     <p style="padding:6px 20px 12px;color:#a0aec0;font-size:12px;">
-      Avg FCF Margin: {{ result.dcf.avg_fcf_margin }}% ·
-      Rev Growth (CAGR): {{ result.dcf.rev_growth }}% ·
-      Discount Rate: {{ result.dcf.r }}% (rf {{ result.dcf.rf }}% + β{{ result.dcf.beta }} × 5.5%) ·
-      Terminal Growth: {{ result.dcf.g_terminal }}%
-      &nbsp;|&nbsp; Negative-FCF years excluded from margin average
+      평균 FCF 마진: {{ result.dcf.avg_fcf_margin }}% ·
+      매출 성장률: {{ result.dcf.rev_growth }}% ·
+      할인율: {{ result.dcf.r }}% (무위험수익률 {{ result.dcf.rf }}% + β{{ result.dcf.beta }} × ERP 5.5%) ·
+      영구성장률: {{ result.dcf.g_terminal }}%
+      &nbsp;|&nbsp; FCF 음수 연도는 마진 평균 계산에서 제외
     </p>
     {% endif %}
   </div>
@@ -635,8 +644,8 @@
 {% if not result %}
 <div style="text-align:center;padding:60px 20px;color:#718096;">
   <div style="font-size:48px;">🇺🇸</div>
-  <p style="margin-top:12px;font-size:16px;font-weight:600;color:#4a5568;">Enter a US ticker to get started</p>
-  <p style="margin-top:6px;font-size:13px;">e.g. AAPL · MSFT · NVDA · GOOGL · AMZN · META · TSLA</p>
+  <p style="margin-top:12px;font-size:16px;font-weight:600;color:#4a5568;">티커를 입력해 분석을 시작하세요</p>
+  <p style="margin-top:6px;font-size:13px;">예: AAPL · MSFT · NVDA · GOOGL · AMZN · META · TSLA</p>
 </div>
 {% endif %}
 
