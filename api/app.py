@@ -827,211 +827,192 @@ def build_fin_table(hist_annual):
     body += '</tbody>'
     return f'<table class="financial-table">{header}{body}</table>'
 
-# ── 6-b. Rolling DCF (Damodaran 7-Stage Lifecycle) ───────────────
-def calc_rolling_dcf(hist_annual, estimates):
+# ── 6-b. Damodaran 4-Stage Life Cycle DCF ───────────────────────
+def calc_rolling_dcf(hist_annual, estimates, life_cycle: int = 2):
     """
-    yfinance + Stockanalysis 데이터 → rolling_dcf 7-Stage 모듈로 변환.
+    yfinance 데이터 → Damodaran 4-Stage Life Cycle DCF 엔진 호출.
 
-    7 Stages (strict sequential filter):
-      Pre-Revenue → Start-up → Cyclical → Declining
-      → High-Growth → Mature-Growth → Mature-Stable
-
-    WACC decay: compounded discrete discount factors (per-year WACC schedule).
-    Terminal Value: FCF_final / (terminal_WACC - rf).
+    life_cycle:
+      1 = Startup      (신생·초기성장기 — Top-Down TAM 기반)
+      2 = High Growth  (고성장기 — 3-Stage ROIC Fading)
+      3 = Mature       (성숙안정기 — Gordon Growth / 2-Stage)
+      4 = Decline      (쇠퇴기 — Liquidating CF)
     """
     try:
-        from api.rolling_dcf import (
-            Financials, ConsensusYear,
-            classify_and_configure, calculate_rolling_targets, build_full_schedule,
-        )
-    except ImportError:
         try:
+            from api.rolling_dcf import Financials, DamodaranDCF
+        except ImportError:
             import sys, os
             sys.path.insert(0, os.path.dirname(__file__))
-            from rolling_dcf import (
-                Financials, ConsensusYear,
-                classify_and_configure, calculate_rolling_targets, build_full_schedule,
-            )
-        except ImportError as e:
-            return {"error": f"rolling_dcf import failed: {e}"}
+            from rolling_dcf import Financials, DamodaranDCF
+    except ImportError as e:
+        return {"error": f"rolling_dcf import failed: {e}"}
 
     try:
-        rows  = hist_annual['rows']
-        est   = estimates
-        sa    = est.get('sa') or {}
+        import datetime
+        rows     = hist_annual['rows']
+        est      = estimates
+        raw_info = est.get('_raw_info', {})
+        price    = safe_float(est.get('price') or hist_annual.get('price'))
 
         # ── rf 실시간 취득 ──────────────────────────────────────────
         try:
-            tnx = yf.Ticker('^TNX')
+            tnx      = yf.Ticker('^TNX')
             tnx_hist = tnx.history(period='5d')
             rf = float(tnx_hist['Close'].iloc[-1]) / 100 if not tnx_hist.empty else 0.044
         except:
             rf = 0.044
 
-        beta  = safe_float(est.get('beta')) or 1.0
-        price = safe_float(est.get('price') or hist_annual.get('price'))
-        tax   = 0.21
+        beta = safe_float(est.get('beta')) or 1.0
 
-        # ── 최신 실적 추출 ──────────────────────────────────────────
-        def get_latest(key):
-            for v in rows.get(key, []):
-                if v is not None: return v
-            return None
-
+        # ── 최신 실적값 추출 ────────────────────────────────────────
         def get_all_valid(key):
             return [v for v in rows.get(key, []) if v is not None]
 
-        rev_vals = get_all_valid('Revenue')
-        op_vals  = get_all_valid('Operating Income')
+        rev_vals  = get_all_valid('Revenue')
+        op_vals   = get_all_valid('Operating Income')
+        capex_vals= get_all_valid('Capex')
+        opcf_vals = get_all_valid('Op CF')
 
-        rev_latest = rev_vals[0]  if rev_vals else 1.0
-        rev_prev   = rev_vals[1]  if len(rev_vals) >= 2 else None
-        op_latest  = op_vals[0]   if op_vals  else None
+        rev_latest  = rev_vals[0]  if rev_vals  else 1.0
+        op_latest   = op_vals[0]   if op_vals   else None
+        capex_latest= capex_vals[0] if capex_vals else 0.0
+        opcf_latest = opcf_vals[0] if opcf_vals  else None
 
-        ebit_margin    = (op_latest / rev_latest) if op_latest is not None and rev_latest else 0.0
-        rev_growth_act = ((rev_latest / rev_prev) - 1) if rev_prev and rev_prev > 0 else 0.05
+        ebit_latest = op_latest  if op_latest is not None else rev_latest * 0.10
+        ebit_margin = ebit_latest / rev_latest if rev_latest else 0.10
 
-        # ── 과거 시계열 (분류기 입력) ────────────────────────────────
-        hist_ebit_margins: list[float] = []
-        for op, rv in zip(op_vals, rev_vals):
-            if rv and rv != 0:
-                hist_ebit_margins.append(op / rv)
+        # D&A = OpCF - NetIncome (fallback: capex proxy)
+        net_vals = get_all_valid('Net Income')
+        net_latest = net_vals[0] if net_vals else None
+        if opcf_latest is not None and net_latest is not None:
+            da_latest = max(opcf_latest - net_latest, 0.0)
+            if da_latest < capex_latest * 0.3:
+                da_latest = capex_latest * 0.7   # sanity floor
+        else:
+            da_latest = capex_latest * 0.7
 
-        # 매출 성장률 시계열 (최대 5년)
-        hist_rev_growth: list[float] = []
-        for i in range(len(rev_vals) - 1):
-            if rev_vals[i] and rev_vals[i+1] and rev_vals[i+1] > 0:
-                hist_rev_growth.append(rev_vals[i] / rev_vals[i+1] - 1)
-        hist_rev_growth = hist_rev_growth[:5]
+        # Change in Working Capital (best effort)
+        change_wc = 0.0
+        if opcf_latest is not None and net_latest is not None:
+            # rough: OpCF - NetIncome - DA ≈ ΔWC (negative = cash outflow absorbed)
+            approx_wc = opcf_latest - (net_latest or 0) - da_latest
+            change_wc = max(-rev_latest * 0.1, min(approx_wc, rev_latest * 0.1))
 
-        # ── Cash & Debt ─────────────────────────────────────────────
-        raw_info = est.get('_raw_info', {})
-        cash_b   = fmt_b(safe_float(raw_info.get('totalCash'))) or 0.0
-        debt_b   = fmt_b(safe_float(raw_info.get('totalDebt'))) or 0.0
+        # ── 세율 추정 ──────────────────────────────────────────────
+        # 세전이익 기준 실효세율; 없으면 US 법정세율 21%
+        tax_rate = 0.21
+        try:
+            income_stmt = hist_annual.get('_income_stmt')
+            # yfinance income_stmt에서 Tax Provision / Pretax Income
+            if income_stmt is not None and not income_stmt.empty:
+                for taxkey in ('Tax Provision', 'Income Tax Expense'):
+                    if taxkey in income_stmt.index:
+                        tax_prov = safe_float(income_stmt.loc[taxkey].iloc[0])
+                        for prekey in ('Pretax Income', 'Income Before Tax'):
+                            if prekey in income_stmt.index:
+                                pretax = safe_float(income_stmt.loc[prekey].iloc[0])
+                                if pretax and pretax > 0 and tax_prov and tax_prov > 0:
+                                    tax_rate = min(tax_prov / pretax, 0.40)
+                                break
+                        break
+        except:
+            pass
 
-        # ── Shares ──────────────────────────────────────────────────
-        sh_raw   = safe_float(est.get('shares_outstanding'))
-        shares_b = (sh_raw / 1e9) if sh_raw and sh_raw > 1e6 else None
+        # ── Balance Sheet 데이터 ────────────────────────────────────
+        cash_b = fmt_b(safe_float(raw_info.get('totalCash'))) or 0.0
+        debt_b = fmt_b(safe_float(raw_info.get('totalDebt'))) or 0.0
+        # minority interest: US firms 대부분 0
+        minority_b = 0.0
+
+        # ── Shares (B-shares) ───────────────────────────────────────
+        shares_b = None
+        sh_raw = safe_float(est.get('shares_outstanding'))
+        if sh_raw and sh_raw > 1e6:
+            shares_b = sh_raw / 1e9
+
         if not shares_b:
+            eps_vals = get_all_valid('EPS (Diluted)')
+            for net, eps in zip(net_vals, eps_vals):
+                if net and eps and abs(eps) > 0.01 and net > 0:
+                    shares_b = net / eps   # B-USD / (USD/share) = B-shares
+                    break
+
+        if not shares_b and price:
             mktcap_b = safe_float(est.get('market_cap'))
-            if mktcap_b and price:
+            if mktcap_b:
                 shares_b = mktcap_b / price
+
         shares_b = shares_b or 1.0
 
-        # ── Financials ──────────────────────────────────────────────
-        actuals = Financials(
+        # ── Financials 객체 구성 ───────────────────────────────────
+        fin = Financials(
             revenue           = rev_latest,
+            ebit              = ebit_latest,
             ebit_margin       = ebit_margin,
-            revenue_growth    = rev_growth_act,
-            cash              = cash_b,
+            tax_rate          = tax_rate,
+            depr_amort        = da_latest,
+            capex             = capex_latest,
+            change_wc         = change_wc,
+            cash_st           = cash_b,
             debt              = debt_b,
+            minority_interest = minority_b,
             shares            = shares_b,
-            hist_ebit_margins = hist_ebit_margins,
-            hist_rev_growth   = hist_rev_growth,
         )
 
-        # ── Industry margin 추정 ────────────────────────────────────
-        if ebit_margin <= 0:
-            industry_margin = 0.15
-        else:
-            industry_margin = max(min((ebit_margin + 0.25) / 2, 0.35), 0.10)
+        # ── DCF 엔진 실행 ───────────────────────────────────────────
+        engine = DamodaranDCF(fin, rf=rf, erp=0.055, beta=beta)
+        result = engine.calculate_intrinsic_value(stage=life_cycle)
 
-        # ── Sales-to-Capital ────────────────────────────────────────
-        capex_latest = get_latest('Capex') or rev_latest * 0.05
-        stc = max(rev_latest / max(abs(capex_latest) * 5, 0.01), 0.5)
-        stc = min(stc, 5.0)
+        iv      = result.get('intrinsic_value', 0.0)
+        upside  = round((iv - price) / price * 100, 1) if price and price > 0 else None
 
-        # ── ConsensusYear 구성 ──────────────────────────────────────
-        sa_rev = sa.get('rev', {})
-        sa_eps = sa.get('eps', {})
-        consensus_years: list[ConsensusYear] = []
+        stage_names = {
+            1: 'Startup',
+            2: 'High Growth',
+            3: 'Mature',
+            4: 'Decline',
+        }
+        stage_name = stage_names.get(life_cycle, 'High Growth')
 
-        for yr_int in (2026, 2027, 2028):
-            fy_key = f'FY{yr_int}'
-            rev_v  = sa_rev.get(fy_key, {}).get('avg')
-            if not rev_v:
-                rev_v = est.get('curr_yr_rev') if yr_int == 2026 else est.get('next_yr_rev')
-            if not rev_v:
-                base  = consensus_years[-1].revenue if consensus_years else rev_latest
-                rev_v = base * (1 + max(rev_growth_act, 0.03))
-
-            eps_v = sa_eps.get(fy_key, {}).get('avg')
-            if eps_v and rev_v and shares_b > 0:
-                net_est    = eps_v * shares_b
-                ebit_est   = net_est / (1 - tax)
-                # Cap at -1.0 (EPS-derived margins can be -2x~-5x due to share count issues)
-                margin_est = max(min(ebit_est / rev_v, 0.60), -1.0)
-            else:
-                margin_est = ebit_margin
-
-            consensus_years.append(ConsensusYear(
-                year=yr_int, revenue=rev_v, ebit_margin=margin_est,
-            ))
-
-        # ── 7단계 분류 + StageConfig ────────────────────────────────
-        stage, cfg = classify_and_configure(
-            actuals          = actuals,
-            rf               = rf,
-            industry_margin  = industry_margin,
-            sales_to_capital = stc,
-            consensus        = consensus_years,
-        )
-
-        # ── FCF 스케줄 ──────────────────────────────────────────────
-        schedule_df = build_full_schedule(actuals, consensus_years, cfg, rf, tax)
+        # FCFF 스케줄 정리 (display용 반올림)
         schedule = []
-        for yr, row in schedule_df.iterrows():
+        for row in result.get('fcff_schedule', []):
             schedule.append({
-                'year':         int(yr),
-                'revenue':      row.get('revenue'),
-                'rev_growth':   row.get('rev_growth'),
-                'ebit_margin':  row.get('ebit_margin'),
-                'nopat':        row.get('nopat'),
-                'reinvestment': row.get('reinvestment'),
-                'fcf':          row.get('fcf'),
-                'wacc':         row.get('wacc'),
-                'source':       row.get('source'),
-            })
-
-        # ── 롤링 타겟 ───────────────────────────────────────────────
-        targets_df = calculate_rolling_targets(actuals, consensus_years, cfg, rf, tax)
-        targets = []
-        for yr, row in targets_df.iterrows():
-            tp     = float(row['target_price'])
-            upside = round((tp - price) / price * 100, 1) if price and price > 0 else None
-            targets.append({
-                'year':           int(yr),
-                'stage':          row['stage'],
-                'horizon':        int(row['horizon']),
-                'proj_window':    row['proj_window'],
-                'survival_prob':  float(row['survival_prob']),
-                'wacc_start_pct': float(row['wacc_start_pct']),
-                'wacc_end_pct':   float(row['wacc_end_pct']),
-                'pv_fcfs_B':      float(row['pv_fcfs']),
-                'pv_tv_B':        float(row['pv_tv']),
-                'ev_B':           float(row['ev']),
-                'base_cash_B':    float(row['base_cash']),
-                'debt_B':         float(row['debt']),
-                'equity_B':       float(row['equity']),
-                'target_price':   round(tp, 2),
-                'upside_pct':     upside,
+                'year':       row.get('year'),
+                'revenue':    round(row['revenue'], 2) if row.get('revenue') is not None else None,
+                'nopat':      round(row['nopat'],   4) if row.get('nopat')   is not None else None,
+                'fcf':        round(row['fcf'],     4) if row.get('fcf')     is not None else None,
+                'pv_fcf':     round(row['pv_fcf'],  4) if row.get('pv_fcf')  is not None else None,
+                'reinv_rate': round(row.get('reinv_rate', 0), 4),
+                'growth_g':   round(row['growth_g'], 4) if row.get('growth_g') is not None else None,
+                'roic':       round(row['roic'],    4) if row.get('roic')    is not None else None,
+                'phase':      row.get('phase', ''),
             })
 
         return {
-            'stage':           stage,
-            'horizon':         cfg.horizon,
-            'wacc_start':      round(cfg.wacc_start * 100, 2),
-            'wacc_end':        round(cfg.wacc_end   * 100, 2),
+            'life_cycle':      life_cycle,
+            'stage':           stage_name,
+            'intrinsic_value': round(iv, 2),
+            'upside_pct':      upside,
+            'ev':              round(result.get('ev', 0), 2),
+            'equity_value':    round(result.get('equity_value', 0), 2),
+            'cash_st':         round(result.get('cash_st', 0), 2),
+            'debt':            round(result.get('debt', 0), 2),
+            'wacc':            round(result.get('wacc', 0) * 100, 2),
+            'coe':             round(result.get('coe', 0)  * 100, 2),
             'rf':              round(rf * 100, 2),
             'beta':            round(beta, 2),
-            'terminal_g':      round(rf * 100, 2),
-            'industry_margin': round(industry_margin * 100, 1),
-            'tax_rate':        round(tax * 100, 1),
-            'stc':             round(stc, 2),
-            'survival_prob':   round(cfg.survival_prob, 2),
-            'target_margin':   round(cfg.target_margin * 100, 1),
+            'erp':             5.5,
+            'terminal_g':      round(result.get('terminal_g', rf) * 100, 2) if result.get('terminal_g') is not None else round(rf * 100, 2),
+            'tax_rate':        round(tax_rate * 100, 1),
+            'shares':          round(shares_b, 3),
+            'roic_base':       round(result.get('roic_base', 0) * 100, 2) if result.get('roic_base') is not None else None,
+            'g_base':          round(result.get('g_base', 0) * 100, 2)    if result.get('g_base')    is not None else None,
+            'pv_stage1':       round(result.get('pv_stage1', 0), 2),
+            'pv_stage2':       round(result.get('pv_stage2', 0), 2),
+            'pv_terminal_value': round(result.get('pv_terminal_value', 0), 2),
             'schedule':        schedule,
-            'targets':         targets,
         }
 
     except Exception:
@@ -1040,7 +1021,7 @@ def calc_rolling_dcf(hist_annual, estimates):
 
 
 # ── 7. 메인 분석 함수 ────────────────────────────────────────────
-def analyze_us_stock(ticker_symbol):
+def analyze_us_stock(ticker_symbol, life_cycle: int = 2):
     ticker_symbol = ticker_symbol.strip().upper()
 
     raw = fetch_yf_data(ticker_symbol)
@@ -1057,35 +1038,36 @@ def analyze_us_stock(ticker_symbol):
             return {"error": "Failed to parse financial history."}
 
         est     = get_estimates(raw)
-        # cash/debt raw info를 est에 주입 (rolling DCF 브리지용)
+        # cash/debt raw info를 est에 주입 (DCF 브리지용)
         est['_raw_info'] = raw['info']
         dcf     = calc_dcf(hist, est)
         band    = calc_band(hist, est)
         fin_tbl = build_fin_table(hist)
-        rdcf    = calc_rolling_dcf(hist, est)
+        rdcf    = calc_rolling_dcf(hist, est, life_cycle=life_cycle)
 
         return {
-            "ticker":  ticker_symbol,
-            "name":    name,
-            "sector":  est.get('sector', ''),
-            "industry": est.get('industry', ''),
-            "price":   f"${est['price']:.2f}" if est.get('price') else "N/A",
-            "price_raw": est.get('price'),
-            "w52_high": est.get('w52_high'),
-            "w52_low":  est.get('w52_low'),
+            "ticker":     ticker_symbol,
+            "name":       name,
+            "sector":     est.get('sector', ''),
+            "industry":   est.get('industry', ''),
+            "price":      f"${est['price']:.2f}" if est.get('price') else "N/A",
+            "price_raw":  est.get('price'),
+            "w52_high":   est.get('w52_high'),
+            "w52_low":    est.get('w52_low'),
             "market_cap": est.get('market_cap'),
-            "beta":    est.get('beta'),
-            "div_yield": round(est['div_yield'] * 100, 2) if est.get('div_yield') else None,
-            "div_rate":  est.get('div_rate'),
-            "roe_pct":   est.get('roe_pct'),
-            "roa_pct":   est.get('roa_pct'),
-            "de_ratio":  est.get('de_ratio'),
-            "raw_table": fin_tbl,
-            "est":       est,
-            "sa":        est.get('sa'),
-            "dcf":       dcf,
-            "band":      band,
-            "rdcf":      rdcf,
+            "beta":       est.get('beta'),
+            "div_yield":  round(est['div_yield'] * 100, 2) if est.get('div_yield') else None,
+            "div_rate":   est.get('div_rate'),
+            "roe_pct":    est.get('roe_pct'),
+            "roa_pct":    est.get('roa_pct'),
+            "de_ratio":   est.get('de_ratio'),
+            "raw_table":  fin_tbl,
+            "est":        est,
+            "sa":         est.get('sa'),
+            "dcf":        dcf,
+            "band":       band,
+            "rdcf":       rdcf,
+            "life_cycle": life_cycle,
         }
     except Exception as e:
         import traceback
@@ -1094,13 +1076,20 @@ def analyze_us_stock(ticker_symbol):
 # ── Flask 라우트 ─────────────────────────────────────────────────
 @app.route('/', methods=['GET', 'POST'])
 def index():
-    result = None
-    ticker = ""
+    result     = None
+    ticker     = ""
+    life_cycle = 2
     if request.method == 'POST':
         ticker = request.form.get('ticker', '').strip().upper()
+        try:
+            life_cycle = int(request.form.get('life_cycle', 2))
+            if life_cycle not in (1, 2, 3, 4):
+                life_cycle = 2
+        except (ValueError, TypeError):
+            life_cycle = 2
         if ticker:
-            result = analyze_us_stock(ticker)
-    return render_template('index.html', result=result, ticker=ticker)
+            result = analyze_us_stock(ticker, life_cycle=life_cycle)
+    return render_template('index.html', result=result, ticker=ticker, life_cycle=life_cycle)
 
 if __name__ == '__main__':
     app.run(debug=True)

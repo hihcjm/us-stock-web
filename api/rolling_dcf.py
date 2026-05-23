@@ -1,713 +1,521 @@
 """
-7-Stage Lifecycle Rolling DCF Valuation Model
-==============================================
-Damodaran Framework — Production-Ready, Modular
+rolling_dcf.py  (us_stock_web)
+==============================
+Aswath Damodaran 4-Stage Life Cycle DCF Valuation Engine
+for US Stocks  — USD / B-shares unit convention
 
-Stages (strict sequential filter):
-  1. Cyclical     — 10Y EBIT-margin StdDev > 8%
-  2. Declining    — 3Y avg revenue growth < 0%
-  3. Pre-Revenue  — Revenue negligible (<= threshold)
-  4. Start-up     — EBIT < 0  (post-revenue, not cyclical/declining)
-  5. High-Growth  — Rev Growth > 15%
-  6. Mature-Growth— 8% < Rev Growth <= 15%
-  7. Mature-Stable— 0% <= Rev Growth <= 8%
+Unit Convention
+---------------
+  All monetary values : B-USD  (billions of dollars)
+  shares              : B-shares (billions of shares)
+  intrinsic_value     : USD per share  = equity_value(B) / shares(B)
+  Rates               : fraction (0.0 – 1.0)
 
-Key design rules per stage:
-  WACC Decay  : compounded discrete discount factors (no flat WACC assumption)
-  Reinvestment: DeltaRev / Sales-to-Capital  (Cyclical: capped at Rev * 0.15)
-  Terminal Value: FCF_final / (Terminal_WACC - RFR)
-  Survival Prob : applied to EV only (not cash)
+US Market Parameters (vs Korea)
+--------------------------------
+  ERP   : 5.5%  (Damodaran US implied ERP, no CRP needed)
+  rf    : 10Y US Treasury (fetched live, fallback 4.4%)
+  Tax   : 21%  (US federal statutory rate)
+  WACC cap: no minority-interest deduction (US GAAP, not K-IFRS)
+
+Usage
+-----
+  fin = Financials(
+      revenue=383.0, ebit=114.0, ebit_margin=0.297, tax_rate=0.15,
+      depr_amort=11.5, capex=11.0, change_wc=0.5,
+      cash_st=29.9, debt=104.0, minority_interest=0.0,
+      shares=15.4,          # B-shares  (15.4B shares)
+  )
+  engine = DamodaranDCF(fin, rf=0.044, erp=0.055, beta=1.25)
+  result = engine.calculate_intrinsic_value(stage=2)
+  print(result['intrinsic_value'])   # USD per share
 """
 
 from __future__ import annotations
-
 import math
-import statistics
-from dataclasses import dataclass, field
-from typing import Literal, Optional
-
-import pandas as pd
+from dataclasses import dataclass
+from typing import Optional
 
 
-# ---------------------------------------------------------------------------
-# 1. CONSTANTS & TYPE ALIASES
-# ---------------------------------------------------------------------------
-
-Stage = Literal[
-    "Cyclical",
-    "Declining",
-    "Pre-Revenue",
-    "Start-up",
-    "High-Growth",
-    "Mature-Growth",
-    "Mature-Stable",
-]
-
-ROLLING_BASES: tuple[int, ...] = (2026, 2027, 2028)
-PRE_REVENUE_THRESHOLD: float   = 0.05   # $B (or T-won equivalent)
-
-
-# ---------------------------------------------------------------------------
-# 2. DATA STRUCTURES
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. Input Data Structure
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class Financials:
-    """Latest-year actuals snapshot."""
-    revenue:              float          # $B or T-won
-    ebit_margin:          float          # fraction (negative OK)
-    revenue_growth:       float          # TTM YoY fraction
-    cash:                 float          # $B or T-won
-    debt:                 float          # $B or T-won
-    shares:               float          # B-shares or T-shares
-    hist_ebit_margins:    list[float]    = field(default_factory=list)  # last <=10Y
-    hist_rev_growth:      list[float]    = field(default_factory=list)  # last <=5Y
-
-
-@dataclass
-class ConsensusYear:
-    year:        int
-    revenue:     float   # $B or T-won
-    ebit_margin: float   # fraction
-
-
-@dataclass
-class StageConfig:
     """
-    Per-stage projection parameters.
-    WACC: if wacc_start == wacc_end -> flat. Otherwise decays linearly over horizon.
+    Latest fiscal-year actuals snapshot.
+    All monetary amounts in B-USD.
     """
-    stage:                   Stage
-    horizon:                 int            # projection years beyond last consensus
-    wacc_start:              float          # WACC at Year 1 of extrapolation
-    wacc_end:                float          # WACC at final year (= terminal WACC)
-    target_margin:           float          # EBIT margin convergence target
-    survival_prob:           float          # multiplied against EV
-    sales_to_capital:        float          # reinvestment: DeltaRev / S2C
-    max_reinv_pct_rev:       float          # reinvestment ceiling (pct of revenue)
-    margin_converge_year:    int            # year by which margin fully converges
-    growth_decays_to_rf:     bool           # True -> growth linearly -> rf
-    margin_fixed:            bool           # True -> hold consensus margin (no convergence)
-    growth_fixed:            bool           # True -> force growth = rf from Year 1
+    # ── Income Statement ────────────────────────────────────────────────────
+    revenue:            float   # Total Revenue (B-USD)
+    ebit:               float   # Operating Income / EBIT (B-USD)
+    ebit_margin:        float   # EBIT margin = ebit / revenue (fraction)
+    tax_rate:           float   # Effective tax rate (fraction, e.g. 0.15)
+
+    # ── Cash Flow Statement ─────────────────────────────────────────────────
+    depr_amort:         float   # D&A  (B-USD)
+    capex:              float   # Capital Expenditures, positive (B-USD)
+    change_wc:          float   # Change in Working Capital (B-USD, increase=positive=cash outflow)
+
+    # ── Balance Sheet ───────────────────────────────────────────────────────
+    cash_st:            float   # Cash + Short-term Investments (B-USD)
+    debt:               float   # Total Debt (B-USD)
+    minority_interest:  float   # Non-controlling Interest (B-USD, 0 for most US firms)
+
+    # ── Market Data ─────────────────────────────────────────────────────────
+    shares:             float   # Shares Outstanding (B-shares)
+                                # e.g. Apple 15.4B shares → 15.4
 
 
-# ---------------------------------------------------------------------------
-# 3. MODULE 1 — LIFECYCLE CLASSIFIER
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. DCF Engine
+# ═══════════════════════════════════════════════════════════════════════════════
 
-class LifecycleClassifier:
+class DamodaranDCF:
     """
-    Assigns one of 7 Damodaran lifecycle stages via strict sequential filters.
+    Damodaran 4-Stage Life Cycle DCF Engine for US Stocks.
 
-    Filter order (first match wins):
-      F1: Cyclical      — 10Y EBIT-margin StdDev > 8%
-      F2: Declining     — 3Y avg rev growth < 0%
-      F3: Pre-Revenue   — revenue <= PRE_REVENUE_THRESHOLD
-      F4: Start-up      — EBIT margin < 0
-      F5: High-Growth   — rev growth > 15%
-      F6: Mature-Growth — 8% < rev growth <= 15%
-      F7: Mature-Stable — default
+    Parameters
+    ----------
+    financials    : Financials
+    rf            : float   — 10Y US Treasury yield (fraction, default 4.4%)
+    erp           : float   — US Equity Risk Premium (fraction, default 5.5%)
+                             No CRP added (US is base market)
+    beta          : float   — 5-year weekly or 1-year daily beta (default 1.0)
+    debt_spread   : float   — Credit spread over rf (default 1.5%)
+    equity_weight : float | None — explicit E/(D+E). None = auto-estimate.
     """
 
-    CYCLICAL_STD_THRESHOLD: float = 0.08   # 8%
-    DECLINING_GROWTH_WINDOW: int  = 3      # years
+    _GUARD_REINV_MIN  = -0.5
+    _GUARD_REINV_MAX  =  0.95
+    _GUARD_ROIC_FLOOR =  0.001
 
-    def classify(self, f: Financials) -> Stage:
-        # F3 — Pre-Revenue  (must precede cyclical/startup checks)
-        if f.revenue <= PRE_REVENUE_THRESHOLD:
-            return "Pre-Revenue"
-
-        # F4 — Start-up (negative margin, has revenue)
-        if f.ebit_margin < 0:
-            return "Start-up"
-
-        # F1 — Cyclical: only evaluated for profitable, revenue-positive firms.
-        # Uses population stdev (pstdev) over ALL available hist margins.
-        # Requirement: at least 3 data points and CURRENT margin also positive.
-        if f.ebit_margin > 0 and len(f.hist_ebit_margins) >= 3:
-            # pstdev to match Damodaran's full-population normalisation
-            pstd = statistics.pstdev(f.hist_ebit_margins)
-            if pstd > self.CYCLICAL_STD_THRESHOLD:
-                return "Cyclical"
-
-        # F2 — Declining: profitable firm with contracting revenue
-        recent_growth = f.hist_rev_growth[-self.DECLINING_GROWTH_WINDOW:]
-        if len(recent_growth) >= 2:
-            avg_g = sum(recent_growth) / len(recent_growth)
-            if avg_g < 0.0:
-                return "Declining"
-        elif f.revenue_growth < -0.02:
-            return "Declining"
-
-        # F5/F6/F7 — Growth tiers
-        g = f.revenue_growth
-        if g > 0.15:
-            return "High-Growth"
-        if g > 0.08:
-            return "Mature-Growth"
-        return "Mature-Stable"
-
-    def get_config(
+    def __init__(
         self,
-        stage:              Stage,
-        rf:                 float,
-        industry_margin:    float,
-        consensus_margin:   float,
-        hist_avg_margin:    float,
-        sales_to_capital:   float,
-    ) -> StageConfig:
-        """Build StageConfig for the given stage."""
+        financials:     Financials,
+        rf:             float = 0.044,
+        erp:            float = 0.055,
+        beta:           float = 1.0,
+        debt_spread:    float = 0.015,
+        equity_weight:  Optional[float] = None,
+    ):
+        self.fin         = financials
+        self.rf          = rf
+        self.erp         = erp
+        self.beta        = beta
+        self.debt_spread = debt_spread
+        self._eq_weight  = equity_weight
 
-        # Shared defaults
-        s2c = sales_to_capital
+        self.wacc, self.coe, self.cod = self._calculate_wacc()
 
-        if stage == "Pre-Revenue":
-            return StageConfig(
-                stage=stage, horizon=10,
-                wacc_start=0.25,  wacc_end=0.08,
-                target_margin=0.30,
-                survival_prob=0.20,
-                sales_to_capital=s2c, max_reinv_pct_rev=0.50,
-                margin_converge_year=10,
-                growth_decays_to_rf=True, margin_fixed=False, growth_fixed=False,
-            )
+    # ── A. WACC ─────────────────────────────────────────────────────────────
 
-        if stage == "Start-up":
-            return StageConfig(
-                stage=stage, horizon=10,
-                wacc_start=0.18,  wacc_end=0.08,
-                target_margin=max(0.20, industry_margin),
-                survival_prob=0.60,
-                sales_to_capital=s2c, max_reinv_pct_rev=0.40,
-                margin_converge_year=10,
-                growth_decays_to_rf=True, margin_fixed=False, growth_fixed=False,
-            )
-
-        if stage == "High-Growth":
-            return StageConfig(
-                stage=stage, horizon=10,
-                wacc_start=0.12,  wacc_end=0.08,
-                target_margin=industry_margin,
-                survival_prob=1.0,
-                sales_to_capital=s2c, max_reinv_pct_rev=0.35,
-                margin_converge_year=10,
-                growth_decays_to_rf=True, margin_fixed=False, growth_fixed=False,
-            )
-
-        if stage == "Mature-Growth":
-            return StageConfig(
-                stage=stage, horizon=10,
-                wacc_start=0.08,  wacc_end=0.08,
-                target_margin=consensus_margin,
-                survival_prob=1.0,
-                sales_to_capital=s2c, max_reinv_pct_rev=0.25,
-                margin_converge_year=10,
-                growth_decays_to_rf=True, margin_fixed=True, growth_fixed=False,
-            )
-
-        if stage == "Mature-Stable":
-            return StageConfig(
-                stage=stage, horizon=5,
-                wacc_start=0.08,  wacc_end=0.08,
-                target_margin=consensus_margin,
-                survival_prob=1.0,
-                sales_to_capital=s2c, max_reinv_pct_rev=0.20,
-                margin_converge_year=5,
-                growth_decays_to_rf=False, margin_fixed=True, growth_fixed=True,
-            )
-
-        if stage == "Declining":
-            return StageConfig(
-                stage=stage, horizon=5,
-                wacc_start=0.09,  wacc_end=0.09,
-                target_margin=max(industry_margin * 0.5, 0.02),
-                survival_prob=1.0,
-                sales_to_capital=max(s2c * 0.7, 0.3), max_reinv_pct_rev=0.10,
-                margin_converge_year=5,
-                growth_decays_to_rf=False, margin_fixed=False, growth_fixed=False,
-            )
-
-        # Cyclical
-        return StageConfig(
-            stage=stage, horizon=10,
-            wacc_start=0.09,  wacc_end=0.09,
-            target_margin=hist_avg_margin,
-            survival_prob=1.0,
-            sales_to_capital=s2c, max_reinv_pct_rev=0.15,
-            margin_converge_year=1,   # INSTANTLY normalize
-            growth_decays_to_rf=True, margin_fixed=False, growth_fixed=False,
-        )
-
-
-# ---------------------------------------------------------------------------
-# 4. MODULE 2 — FINANCIAL PROJECTOR
-# ---------------------------------------------------------------------------
-
-def _linspace(start: float, end: float, step: int, total: int) -> float:
-    """Linear interpolation: step=1->start, step=total->end."""
-    if total <= 1:
-        return end
-    alpha = (step - 1) / (total - 1)
-    return start * (1 - alpha) + end * alpha
-
-
-def _wacc_at_step(cfg: StageConfig, step: int) -> float:
-    """
-    WACC for this extrapolation step.
-    step=1 -> wacc_start, step=horizon -> wacc_end.
-    """
-    return _linspace(cfg.wacc_start, cfg.wacc_end, step, cfg.horizon)
-
-
-class FinancialProjector:
-    """
-    Converts consensus years -> FCF, then extrapolates beyond last consensus
-    applying stage-specific safety guards.
-    """
-
-    # Stages where negative FCF = investment funded by raised capital, not destruction of value
-    EARLY_STAGES = ("Pre-Revenue", "Start-up")
-
-    def consensus_to_fcf(
-        self,
-        consensus: list[ConsensusYear],
-        actuals:   Financials,
-        cfg:       StageConfig,
-        rf:        float,
-        tax_rate:  float,
-    ) -> pd.DataFrame:
+    def _calculate_wacc(self) -> tuple[float, float, float]:
         """
-        Convert 2026-2028 consensus to FCF rows.
-        Reinvestment = DeltaRev / S2C (capped at Rev * max_reinv_pct_rev).
-
-        Damodaran rule for Pre-Revenue / Start-up:
-          Negative FCF during investment phase is funded by capital already
-          raised (equity/debt issuance), NOT a cash outflow that reduces EV.
-          → fcf_for_dcf = max(raw_fcf, 0)  for early-stage firms only.
-          The raw FCF is still stored for display; only dcf_fcf is 0-floored.
+        WACC for US equities.
+        CoE = rf + β × ERP          (no CRP — US is base market)
+        CoD = rf + spread × (1−t)   (after-tax cost of debt)
+        Weights: caller-supplied or implied via NOPAT capitalisation.
         """
-        # Clamp consensus EBIT margins for early-stage firms
-        # EPS-derived margins can be wildly negative (e.g. -250%) due to
-        # share-count mismatch; cap at -100% to prevent runaway negatives.
-        margin_floor = -1.0 if cfg.stage in self.EARLY_STAGES else -5.0
+        coe = self.rf + self.beta * self.erp
 
-        rows: list[dict] = []
-        prev_rev = actuals.revenue
+        # Cost of Debt: widen spread for loss-making firms
+        spread   = max(self.debt_spread, 0.05) if self.fin.ebit <= 0 else self.debt_spread
+        cod_pre  = self.rf + spread
+        cod      = cod_pre * (1 - self.fin.tax_rate)
 
-        for c in sorted(consensus, key=lambda x: x.year):
-            margin = max(c.ebit_margin, margin_floor)
-            ebit   = c.revenue * margin
-            nopat  = ebit * (1 - tax_rate)
-            reinv  = min(
-                (c.revenue - prev_rev) / cfg.sales_to_capital,
-                c.revenue * cfg.max_reinv_pct_rev,
-            )
-            raw_fcf = nopat - reinv
-            # Damodaran: early-stage negative FCF = funded investment, not value loss
-            fcf = max(raw_fcf, 0.0) if cfg.stage in self.EARLY_STAGES else raw_fcf
-            g   = (c.revenue / prev_rev - 1) if prev_rev and prev_rev > 0 else 0.0
-
-            rows.append({
-                "year":         c.year,
-                "revenue":      round(c.revenue, 4),
-                "rev_growth":   round(g * 100, 2),
-                "ebit_margin":  round(margin * 100, 2),
-                "ebit":         round(ebit, 4),
-                "nopat":        round(nopat, 4),
-                "reinvestment": round(reinv, 4),
-                "fcf":          round(fcf, 4),
-                "wacc":         round(cfg.wacc_start * 100, 2),
-                "source":       "consensus",
-            })
-            prev_rev = c.revenue
-
-        return pd.DataFrame(rows).set_index("year")
-
-    def extrapolate(
-        self,
-        consensus: list[ConsensusYear],
-        actuals:   Financials,
-        cfg:       StageConfig,
-        rf:        float,
-        tax_rate:  float,
-    ) -> pd.DataFrame:
-        """
-        Extrapolate [last_consensus+1 .. last_consensus+horizon+1] FCF rows.
-        +1 extra row = FCF_final+1 used as Terminal Value numerator.
-        Applies all stage-specific guards.
-
-        Damodaran early-stage rule (Pre-Revenue / Start-up):
-          Seed margin is clamped to -1.0 floor (consensus may give -2.5x etc).
-          Negative FCF during convergence phase is 0-floored for DCF purposes:
-          the firm is presumed to fund losses via capital raises, not asset sales.
-          Once margin turns positive the full FCF is used.
-        """
-        sorted_con  = sorted(consensus, key=lambda c: c.year)
-        last        = sorted_con[-1]
-        second_last = sorted_con[-2] if len(sorted_con) >= 2 else None
-
-        # Seed growth from consensus
-        if second_last and second_last.revenue > 0:
-            seed_g = last.revenue / second_last.revenue - 1
+        # Capital structure weights
+        if self._eq_weight is not None:
+            e_w = max(0.0, min(1.0, self._eq_weight))
+            d_w = 1.0 - e_w
         else:
-            seed_g = actuals.revenue_growth
-
-        # Clamp seed margin for early-stage (consensus EBIT can be -250% etc.)
-        margin_floor = -1.0 if cfg.stage in self.EARLY_STAGES else -5.0
-        seed_m = max(last.ebit_margin, margin_floor)
-
-        # Declining: ensure growth starts negative or near zero
-        if cfg.stage == "Declining":
-            seed_g = min(seed_g, -0.01)
-
-        rows:     list[dict] = []
-        prev_rev: float      = last.revenue
-        n_extra = cfg.horizon + 1  # +1 for TV numerator row
-
-        for step in range(1, n_extra + 1):
-            yr = last.year + step
-
-            # ── Growth rate ────────────────────────────────────────
-            if cfg.growth_fixed:
-                g = rf                               # Mature-Stable: flat at rf
-            elif cfg.stage == "Declining":
-                # Decay from seed (negative) toward 0 over horizon
-                g = _linspace(seed_g, 0.0, step, cfg.horizon)
-                g = min(g, 0.0)                      # never positive for Declining
-            elif cfg.growth_decays_to_rf:
-                g = _linspace(seed_g, rf, step, cfg.horizon)
-                g = max(g, rf)                       # floor at rf
+            if self.fin.debt > 0:
+                nopat_proxy = max(self.fin.ebit * (1 - self.fin.tax_rate), 1e-6)
+                implied_ev  = nopat_proxy / max(coe * 0.9, 0.05)
+                d_w = min(self.fin.debt / (implied_ev + self.fin.debt), 0.60)
+                e_w = 1.0 - d_w
             else:
-                g = seed_g
+                e_w, d_w = 1.0, 0.0
 
-            # ── EBIT Margin ────────────────────────────────────────
-            if cfg.margin_fixed:
-                m = seed_m
-            elif cfg.stage == "Cyclical":
-                m = cfg.target_margin               # INSTANT normalization
-            else:
-                converge_step  = min(step, cfg.margin_converge_year)
-                m = _linspace(seed_m, cfg.target_margin, converge_step, cfg.margin_converge_year)
+        wacc = e_w * coe + d_w * cod
+        return wacc, coe, cod
 
-            # ── Revenue ───────────────────────────────────────────
-            rev = prev_rev * (1 + g)
+    # ── B. Utility ──────────────────────────────────────────────────────────
 
-            ebit  = rev * m
-            nopat = ebit * (1 - tax_rate)
+    def _nopat(self) -> float:
+        return self.fin.ebit * (1 - self.fin.tax_rate)
 
-            # ── Reinvestment (stage-specific cap) ─────────────────
-            reinv = min(
-                (rev - prev_rev) / cfg.sales_to_capital,
-                rev * cfg.max_reinv_pct_rev,
-            )
-            # Declining: reinvestment must be non-negative (no capex when shrinking)
-            if cfg.stage == "Declining":
-                reinv = max(reinv, 0.0)
+    def _base_reinvestment_rate(self) -> float:
+        nopat = self._nopat()
+        if nopat <= 0:
+            return 0.5
+        reinv = self.fin.capex - self.fin.depr_amort + self.fin.change_wc
+        rr    = reinv / nopat
+        return max(self._GUARD_REINV_MIN, min(rr, self._GUARD_REINV_MAX))
 
-            raw_fcf = nopat - reinv
-
-            # Damodaran: early-stage negative FCF = funded by capital raises
-            fcf = max(raw_fcf, 0.0) if cfg.stage in self.EARLY_STAGES else raw_fcf
-
-            # ── WACC for this step ────────────────────────────────
-            wacc_t = _wacc_at_step(cfg, min(step, cfg.horizon))
-
-            rows.append({
-                "year":         yr,
-                "revenue":      round(rev, 4),
-                "rev_growth":   round(g * 100, 2),
-                "ebit_margin":  round(m * 100, 2),
-                "ebit":         round(ebit, 4),
-                "nopat":        round(nopat, 4),
-                "reinvestment": round(reinv, 4),
-                "fcf":          round(fcf, 4),
-                "wacc":         round(wacc_t * 100, 2),
-                "source":       "extrapolated",
-            })
-            prev_rev = rev
-
-        return pd.DataFrame(rows).set_index("year")
-
-
-# ---------------------------------------------------------------------------
-# 5. MODULE 3 — ROLLING DCF ENGINE
-# ---------------------------------------------------------------------------
-
-class RollingDCFEngine:
-    """
-    Computes Year-End 2026 / 2027 / 2028 Target Prices.
-
-    For each base_year T:
-      cumulative_pv_factor(T, yr) = product of (1+wacc_t) for t in [T+1..yr]
-      pv_fcf = sum( FCF_yr / cumulative_factor(T, yr) )
-      tv_year = last projection year + 1
-      tv_wacc = WACC at final extrapolation step (= wacc_end)
-      TV = FCF_tv_year / (tv_wacc - rf)
-      pv_tv = TV / cumulative_factor(T, tv_year)
-      EV = (pv_fcf + pv_tv) * survival_prob
-      equity = EV + base_cash - debt
-      target_price = equity / shares
-    """
-
-    def _cumulative_discount(
-        self,
-        wacc_schedule: dict[int, float],
-        base_year:     int,
-        target_year:   int,
-    ) -> float:
+    def _base_roic(self) -> float:
         """
-        Product of (1+wacc_t) for each year from base_year+1 to target_year.
-        wacc_schedule: {year: wacc_fraction}
+        ROIC = NOPAT / Invested Capital
+        IC = max(D&A × 5, Revenue × 0.5)
+        Same logic as pvgo_web, calibrated for US firms.
         """
-        factor = 1.0
-        for yr in range(base_year + 1, target_year + 1):
-            w = wacc_schedule.get(yr, list(wacc_schedule.values())[-1])
-            factor *= (1 + w)
-        return factor
+        nopat        = self._nopat()
+        da           = max(self.fin.depr_amort, 1e-9)
+        ic_da_based  = da * 5.0
+        ic_rev_based = self.fin.revenue * 0.5
+        ic           = max(ic_da_based, ic_rev_based, 1e-9)
+        roic         = nopat / ic
+        return min(max(roic, self._GUARD_ROIC_FLOOR), 0.40)
 
-    def calculate(
+    @staticmethod
+    def _pv(wacc: float, t: int) -> float:
+        return 1.0 / ((1.0 + wacc) ** t)
+
+    def _equity_bridge(
         self,
-        actuals:        Financials,
-        consensus:      list[ConsensusYear],
-        cfg:            StageConfig,
-        rf:             float,
-        tax_rate:       float,
-        rolling_bases:  tuple[int, ...] = ROLLING_BASES,
-    ) -> pd.DataFrame:
-        proj = FinancialProjector()
+        ev:    float,
+        fcffs: Optional[list[dict]] = None,
+        extra: Optional[dict]       = None,
+    ) -> dict:
+        """
+        Equity Bridge (US GAAP):
+          Equity Value = EV + Cash & ST Invest − Total Debt − Minority Interest
+          IV/share     = Equity Value (B-USD) / Shares (B-shares)  =  USD/share
+        """
+        equity_value    = ev + self.fin.cash_st - self.fin.debt - self.fin.minority_interest
+        price_per_share = (equity_value / self.fin.shares) if self.fin.shares > 0 else 0.0
 
-        # Build consensus FCF table
-        con_df = proj.consensus_to_fcf(consensus, actuals, cfg, rf, tax_rate)
+        result = {
+            "intrinsic_value": price_per_share,       # USD per share
+            "ev":              ev,                     # B-USD
+            "equity_value":    equity_value,           # B-USD
+            "cash_st":         self.fin.cash_st,
+            "debt":            self.fin.debt,
+            "minority":        self.fin.minority_interest,
+            "wacc":            self.wacc,
+            "coe":             self.coe,
+            "cod":             self.cod,
+            "rf":              self.rf,
+            "erp":             self.erp,
+            "beta":            self.beta,
+            "fcff_schedule":   fcffs or [],
+        }
+        if extra:
+            result.update(extra)
+        return result
 
-        # Build extrapolated FCF table
-        ext_df = proj.extrapolate(consensus, actuals, cfg, rf, tax_rate)
+    # ── C. Public Interface ─────────────────────────────────────────────────
 
-        # Merge
-        all_df: pd.DataFrame = pd.concat([con_df, ext_df])
+    def calculate_intrinsic_value(self, stage: int = 2, **kwargs) -> dict:
+        """
+        Dispatch to the appropriate stage model.
 
-        # Build WACC schedule: {year: wacc_fraction}
-        # Consensus years use wacc_start; extrapolated use per-step WACC
-        wacc_sched: dict[int, float] = {}
-        for yr in all_df.index:
-            wacc_sched[int(yr)] = all_df.loc[yr, "wacc"] / 100.0
+        stage : 1 = Startup      (Top-Down, TAM-based)
+                2 = High Growth  (3-Stage Bottom-Up, ROIC Fading)
+                3 = Mature       (Gordon Growth or 2-Stage)
+                4 = Decline      (Liquidating Cash Flow)
 
-        # Rolling cash accumulation: Cash_T = Cash_{T-1} + FCF_T
-        rolling_cash: dict[int, float] = {}
-        cash_prev = actuals.cash
-        for c in sorted(consensus, key=lambda x: x.year):
-            fcf_t = float(all_df.loc[c.year, "fcf"])
-            rolling_cash[c.year] = cash_prev + fcf_t
-            cash_prev = rolling_cash[c.year]
+        Returns dict with keys:
+            intrinsic_value  : float  — USD per share
+            ev               : float  — Enterprise Value (B-USD)
+            equity_value     : float  — Equity Value (B-USD)
+            wacc             : float
+            fcff_schedule    : list   — year-by-year FCFF detail
+            stage            : str
+            terminal_g       : float
+            ...
+        """
+        dispatch = {
+            1: self._startup_valuation,
+            2: self._high_growth_valuation,
+            3: self._mature_valuation,
+            4: self._decline_valuation,
+        }
+        return dispatch.get(stage, self._high_growth_valuation)(**kwargs)
 
-        results: list[dict] = []
+    # ── D-1. Stage 1: Startup (Top-Down) ───────────────────────────────────
 
-        for base_year in rolling_bases:
-            proj_start  = base_year + 1
-            proj_end    = sorted(consensus, key=lambda x: x.year)[-1].year + cfg.horizon
-            tv_year     = proj_end + 1          # FCF_final+1 for TV numerator
+    def _startup_valuation(
+        self,
+        tam:                 float = 0.0,
+        target_share:        float = 0.10,
+        target_margin:       float = 0.15,
+        prob_failure:        float = 0.30,
+        liquidation_val_pct: float = 0.50,
+        ramp_years:          int   = 10,
+        **kwargs,
+    ) -> dict:
+        """
+        Stage 1 — Startup: Top-Down revenue ramp.
 
-            # FCF window: proj_start .. proj_end
-            window_idx = [yr for yr in all_df.index if proj_start <= int(yr) <= proj_end]
+        Parameters
+        ----------
+        tam              : Total Addressable Market (B-USD). Default = revenue × 20.
+        target_share     : Market share in year N (default 10%)
+        target_margin    : EBIT margin at year N (default 15%)
+        prob_failure     : Probability of failure (default 30%)
+        liquidation_val_pct : Recovery rate on cash in distress (default 50%)
+        ramp_years       : Projection horizon (default 10)
+        """
+        if tam <= 0:
+            tam = self.fin.revenue * 20.0
 
-            # PV of FCFs using compounded discrete WACCs
-            pv_fcfs = 0.0
-            for yr in window_idx:
-                fcf_yr  = float(all_df.loc[yr, "fcf"])
-                cum_fac = self._cumulative_discount(wacc_sched, base_year, int(yr))
-                pv_fcfs += fcf_yr / cum_fac
+        rev_yr0     = max(self.fin.revenue, 1e-9)
+        rev_yr_n    = tam * target_share
+        margin_yr0  = self.fin.ebit_margin
+        margin_yr_n = target_margin
 
-            # Terminal Value
-            # TV numerator must be positive (negative terminal FCF = no value)
-            if tv_year in all_df.index:
-                fcf_tv = float(all_df.loc[tv_year, "fcf"])
-            else:
-                fcf_tv = float(all_df.iloc[-1]["fcf"])
-            fcf_tv = max(fcf_tv, 0.0)   # negative terminal FCF → TV = 0
+        rr_initial  = 0.85
+        g_terminal  = min(0.025, self.rf)
+        rr_terminal = g_terminal / max(self.wacc, 0.01)
 
-            tv_wacc = cfg.wacc_end
-            spread  = tv_wacc - rf
-            if spread <= 0:
-                spread = 0.01   # safety floor: 100bps
-            tv_undiscounted = fcf_tv / spread
-            cum_tv = self._cumulative_discount(wacc_sched, base_year, tv_year)
-            pv_tv  = tv_undiscounted / cum_tv
+        fcffs, pv_fcff = [], 0.0
 
-            # EV: survival prob applied; never negative (worst case = 0)
-            ev           = max((pv_fcfs + pv_tv) * cfg.survival_prob, 0.0)
-            base_cash    = rolling_cash.get(base_year, actuals.cash)
-            # For early-stage: rolling cash uses RAISED capital, not cumulative FCF
-            # (already 0-floored FCF means cash doesn't drain from operating losses)
-            equity_value = ev + base_cash - actuals.debt
-            target_price = equity_value / actuals.shares if actuals.shares > 0 else float("nan")
-
-            results.append({
-                "valuation_date":  base_year,
-                "stage":           cfg.stage,
-                "horizon":         cfg.horizon,
-                "wacc_start_pct":  round(cfg.wacc_start * 100, 2),
-                "wacc_end_pct":    round(cfg.wacc_end   * 100, 2),
-                "terminal_g_pct":  round(rf * 100, 2),
-                "survival_prob":   round(cfg.survival_prob, 2),
-                "proj_window":     f"{proj_start}-{proj_end}",
-                "tv_year":         tv_year,
-                "fcf_tv":          round(fcf_tv, 4),
-                "tv_spread_pct":   round(spread * 100, 2),
-                "pv_fcfs":         round(pv_fcfs, 4),
-                "pv_tv":           round(pv_tv, 4),
-                "ev":              round(ev, 4),
-                "base_cash":       round(base_cash, 4),
-                "debt":            round(actuals.debt, 4),
-                "equity":          round(equity_value, 4),
-                "shares":          round(actuals.shares, 4),
-                "target_price":    round(target_price, 2),
+        for t in range(1, ramp_years + 1):
+            alpha    = t / ramp_years
+            rev_t    = rev_yr0 * ((rev_yr_n / rev_yr0) ** alpha)
+            margin_t = margin_yr0 + alpha * (margin_yr_n - margin_yr0)
+            ebit_t   = rev_t * margin_t
+            nopat_t  = ebit_t * (1 - self.fin.tax_rate)
+            rr_t     = max(0.0, min(rr_initial + alpha * (rr_terminal - rr_initial), 0.95))
+            fcf_t    = nopat_t * (1 - rr_t)
+            pv_t     = fcf_t * self._pv(self.wacc, t)
+            pv_fcff += pv_t
+            fcffs.append({
+                "year": t, "revenue": round(rev_t, 4), "ebit": round(ebit_t, 4),
+                "nopat": round(nopat_t, 4), "reinv_rate": round(rr_t, 4),
+                "fcf": round(fcf_t, 4), "pv_fcf": round(pv_t, 4), "phase": "ramp",
             })
 
-        return pd.DataFrame(results).set_index("valuation_date")
+        last_nopat = fcffs[-1]["nopat"] * (1 + g_terminal)
+        fcf_term   = last_nopat * (1 - rr_terminal)
+        tv         = fcf_term / max(self.wacc - g_terminal, 0.001)
+        pv_tv      = tv * self._pv(self.wacc, ramp_years)
+
+        going_concern_ev = pv_fcff + pv_tv
+        liquidation_val  = (self.fin.cash_st + self.fin.depr_amort * 3) * liquidation_val_pct
+        ev               = going_concern_ev * (1 - prob_failure) + liquidation_val * prob_failure
+
+        extra = {
+            "stage": "startup", "tam": tam, "target_share": target_share,
+            "target_margin": target_margin, "prob_failure": prob_failure,
+            "going_concern_ev": going_concern_ev, "liquidation_val": liquidation_val,
+            "terminal_g": g_terminal,
+            "pv_stage": round(pv_fcff, 4), "pv_terminal_value": round(pv_tv, 4),
+        }
+        return self._equity_bridge(ev, fcffs, extra)
+
+    # ── D-2. Stage 2: High Growth (3-Stage Bottom-Up) ──────────────────────
+
+    def _high_growth_valuation(
+        self,
+        g_override:    Optional[float] = None,
+        roic_override: Optional[float] = None,
+        **kwargs,
+    ) -> dict:
+        """
+        Stage 2 — High Growth: 3-Stage Bottom-Up.
+
+        Phase 1 (t=1–5)  : High growth — current ROIC & RR maintained
+        Phase 2 (t=6–10) : Transition  — ROIC fades linearly to WACC
+        Phase 3 (t=11–∞) : Perpetuity  — ROIC = WACC, g = rf (terminal)
+
+        g_override    : Override implied growth rate
+        roic_override : Override ROIC estimate
+        """
+        roic    = roic_override if roic_override is not None else self._base_roic()
+        rr_base = self._base_reinvestment_rate()
+        g_base  = g_override if g_override is not None else (roic * rr_base)
+        g_base  = min(g_base, 0.35)
+
+        nopat_base    = self._nopat()
+        current_nopat = nopat_base
+        fcffs, pv_fcff, pv_s1, pv_s2 = [], 0.0, 0.0, 0.0
+
+        for t in range(1, 11):
+            if t <= 5:
+                g_t, roic_t, phase = g_base, roic, "high_growth"
+            else:
+                alpha  = (t - 5) / 5.0
+                g_t    = g_base * (1 - alpha) + self.rf * alpha
+                roic_t = max(roic * (1 - alpha) + self.wacc * alpha, self._GUARD_ROIC_FLOOR)
+                phase  = "transition"
+
+            rr_t = max(0.0, min(g_t / roic_t, self._GUARD_REINV_MAX))
+            current_nopat *= (1 + g_t)
+            fcf_t = current_nopat * (1 - rr_t)
+            pv_t  = fcf_t * self._pv(self.wacc, t)
+            pv_fcff += pv_t
+            pv_s1 += pv_t if t <= 5 else 0
+            pv_s2 += pv_t if t >  5 else 0
+
+            fcffs.append({
+                "year": t, "growth_g": round(g_t, 4), "roic": round(roic_t, 4),
+                "reinv_rate": round(rr_t, 4), "nopat": round(current_nopat, 4),
+                "fcf": round(fcf_t, 4), "pv_fcf": round(pv_t, 4), "phase": phase,
+            })
+
+        g_terminal  = min(g_base, self.rf)
+        rr_terminal = g_terminal / max(self.wacc, 0.001)
+        nopat_t11   = current_nopat * (1 + g_terminal)
+        fcf_t11     = nopat_t11 * (1 - rr_terminal)
+        tv          = fcf_t11 / max(self.wacc - g_terminal, 0.001)
+        pv_tv       = tv * self._pv(self.wacc, 10)
+
+        extra = {
+            "stage": "high_growth", "g_base": round(g_base, 4),
+            "roic_base": round(roic, 4), "rr_base": round(rr_base, 4),
+            "terminal_g": round(g_terminal, 4),
+            "pv_stage1": round(pv_s1, 4), "pv_stage2": round(pv_s2, 4),
+            "pv_terminal_value": round(pv_tv, 4),
+        }
+        return self._equity_bridge(pv_fcff + pv_tv, fcffs, extra)
+
+    # ── D-3. Stage 3: Mature ────────────────────────────────────────────────
+
+    def _mature_valuation(
+        self,
+        g_stable:      float = 0.025,
+        use_two_stage: bool  = True,
+        g_near:        float = 0.05,
+        near_years:    int   = 5,
+        **kwargs,
+    ) -> dict:
+        """
+        Stage 3 — Mature: Stable growth.
+
+        [Rule] terminal_g = min(g_stable, rf)  — never exceeds risk-free rate.
+
+        g_stable      : Perpetual growth rate (default 2.5%). Capped at rf.
+        use_two_stage : True = near-term + perpetuity; False = Gordon Growth only.
+        g_near        : Near-term growth (default 5%)
+        near_years    : Near-term period length (default 5)
+        """
+        g_terminal  = min(g_stable, self.rf)
+        nopat_base  = self._nopat()
+        rr_terminal = g_terminal / max(self.wacc, 0.001)
+
+        fcffs, pv_fcff = [], 0.0
+
+        if use_two_stage:
+            g_near_eff    = min(g_near, self.wacc)
+            current_nopat = nopat_base
+            for t in range(1, near_years + 1):
+                rr_t = max(rr_terminal, min(g_near_eff / max(self._base_roic(), 0.001), 0.80))
+                current_nopat *= (1 + g_near_eff)
+                fcf_t  = current_nopat * (1 - rr_t)
+                pv_t   = fcf_t * self._pv(self.wacc, t)
+                pv_fcff += pv_t
+                fcffs.append({
+                    "year": t, "growth_g": round(g_near_eff, 4), "reinv_rate": round(rr_t, 4),
+                    "nopat": round(current_nopat, 4), "fcf": round(fcf_t, 4),
+                    "pv_fcf": round(pv_t, 4), "phase": "near_stable",
+                })
+            nopat_tv = current_nopat * (1 + g_terminal)
+            fcf_tv   = nopat_tv * (1 - rr_terminal)
+            tv       = fcf_tv / max(self.wacc - g_terminal, 0.001)
+            pv_tv    = tv * self._pv(self.wacc, near_years)
+            ev       = pv_fcff + pv_tv
+        else:
+            fcf_stable = nopat_base * (1 + g_terminal) * (1 - rr_terminal)
+            tv         = fcf_stable / max(self.wacc - g_terminal, 0.001)
+            ev         = tv
+            pv_tv      = ev
+            fcffs.append({
+                "year": "inf", "growth_g": round(g_terminal, 4),
+                "reinv_rate": round(rr_terminal, 4), "nopat": round(nopat_base, 4),
+                "fcf": round(fcf_stable / (1 + g_terminal), 4),
+                "pv_fcf": round(ev, 4), "phase": "gordon_growth",
+            })
+
+        extra = {
+            "stage": "mature", "terminal_g": round(g_terminal, 4),
+            "terminal_g_capped": g_terminal < g_stable, "rf_cap": self.rf,
+            "two_stage": use_two_stage,
+            "pv_near": round(pv_fcff, 4), "pv_terminal_value": round(pv_tv, 4),
+        }
+        return self._equity_bridge(ev, fcffs, extra)
+
+    # ── D-4. Stage 4: Decline ───────────────────────────────────────────────
+
+    def _decline_valuation(
+        self,
+        g_decline:         float = -0.05,
+        capex_ratio:       float = 0.50,
+        liquidation_years: int   = 10,
+        terminal_multiple: float = 3.0,
+        **kwargs,
+    ) -> dict:
+        """
+        Stage 4 — Decline: Liquidating Cash Flow model.
+
+        CapEx < D&A  →  negative reinvestment rate
+        → cash generation EXCEEDS NOPAT via asset run-off.
+
+        g_decline         : Annual revenue decline (default −5%, sign auto-corrected)
+        capex_ratio       : CapEx / D&A ratio (default 0.50 → CapEx = 50% of D&A)
+        liquidation_years : Runoff period (default 10)
+        terminal_multiple : Residual asset value = D&A × multiple (default 3×)
+        """
+        g_decline = -abs(g_decline)
+        nopat_base, da_base, rev_t = self._nopat(), self.fin.depr_amort, self.fin.revenue
+        wc_release_rate = 0.02
+        fcffs, pv_fcff = [], 0.0
+
+        for t in range(1, liquidation_years + 1):
+            rev_t  *= (1 + g_decline)
+            da_t    = da_base * max(1 + g_decline * t * 0.5, 0.2)
+            capex_t = da_t * capex_ratio
+            wc_in   = rev_t * wc_release_rate
+            margin_t = self.fin.ebit_margin * max(1 + g_decline * t * 0.3, 0.3)
+            nopat_t  = rev_t * margin_t * (1 - self.fin.tax_rate)
+            reinv_t  = max(-0.80, min((capex_t - da_t - wc_in) / max(abs(nopat_t), 1e-9), 0.20))
+            fcf_t    = nopat_t * (1 - reinv_t)
+            pv_t     = fcf_t * self._pv(self.wacc, t)
+            pv_fcff += pv_t
+            fcffs.append({
+                "year": t, "revenue": round(rev_t, 4), "ebit": round(rev_t * margin_t, 4),
+                "nopat": round(nopat_t, 4), "capex": round(capex_t, 4), "da": round(da_t, 4),
+                "reinv_rate": round(reinv_t, 4), "fcf": round(fcf_t, 4),
+                "pv_fcf": round(pv_t, 4), "phase": "decline",
+            })
+
+        residual = da_base * terminal_multiple * self._pv(self.wacc, liquidation_years)
+        ev       = pv_fcff + residual
+        extra    = {
+            "stage": "decline", "g_decline": round(g_decline, 4),
+            "capex_ratio": capex_ratio, "pv_operating": round(pv_fcff, 4),
+            "pv_liquidation": round(residual, 4), "terminal_g": g_decline,
+        }
+        return self._equity_bridge(ev, fcffs, extra)
 
 
-# ---------------------------------------------------------------------------
-# 6. PUBLIC CONVENIENCE API  (used by app.py bridges)
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. Quick Sanity Check  (python api/rolling_dcf.py)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def classify_and_configure(
-    actuals:           Financials,
-    rf:                float,
-    industry_margin:   float,
-    sales_to_capital:  float,
-    consensus:         list[ConsensusYear],
-) -> tuple[Stage, StageConfig]:
-    """One-call helper: classify -> build StageConfig."""
-    clf  = LifecycleClassifier()
-    stage = clf.classify(actuals)
-
-    last_con_margin = sorted(consensus, key=lambda c: c.year)[-1].ebit_margin if consensus else actuals.ebit_margin
-    hist_avg_margin = (statistics.mean(actuals.hist_ebit_margins)
-                       if len(actuals.hist_ebit_margins) >= 2 else actuals.ebit_margin)
-
-    cfg = clf.get_config(
-        stage            = stage,
-        rf               = rf,
-        industry_margin  = industry_margin,
-        consensus_margin = last_con_margin,
-        hist_avg_margin  = hist_avg_margin,
-        sales_to_capital = sales_to_capital,
+def _sanity_check():
+    """Apple FY2024 approximate figures."""
+    fin = Financials(
+        revenue=391.0, ebit=123.2, ebit_margin=0.315,
+        tax_rate=0.15, depr_amort=11.5, capex=9.4, change_wc=0.5,
+        cash_st=65.0, debt=101.0, minority_interest=0.0, shares=15.4,
     )
-    return stage, cfg
+    engine = DamodaranDCF(fin, rf=0.044, erp=0.055, beta=1.25)
+    print("=" * 60)
+    print("  Damodaran 4-Stage DCF  (Apple FY2024 approx.)")
+    print("=" * 60)
+    print(f"  WACC: {engine.wacc*100:.2f}%  CoE: {engine.coe*100:.2f}%  rf: {engine.rf*100:.2f}%")
+    print("-" * 60)
+    for stage, name in [(1,"Startup"),(2,"High Growth"),(3,"Mature"),(4,"Decline")]:
+        kw = {}
+        if stage == 1:
+            kw = dict(tam=3000.0, target_share=0.15, target_margin=0.20, prob_failure=0.05)
+        res = engine.calculate_intrinsic_value(stage=stage, **kw)
+        print(f"  Stage {stage} ({name:12s}): IV = ${res['intrinsic_value']:>8,.2f}/share  EV = ${res['ev']:.1f}B")
+    print("=" * 60)
 
-
-def build_full_schedule(
-    actuals:   Financials,
-    consensus: list[ConsensusYear],
-    cfg:       StageConfig,
-    rf:        float,
-    tax_rate:  float,
-) -> pd.DataFrame:
-    proj   = FinancialProjector()
-    con_df = proj.consensus_to_fcf(consensus, actuals, cfg, rf, tax_rate)
-    ext_df = proj.extrapolate(consensus, actuals, cfg, rf, tax_rate)
-    return pd.concat([con_df, ext_df])
-
-
-def calculate_rolling_targets(
-    actuals:   Financials,
-    consensus: list[ConsensusYear],
-    cfg:       StageConfig,
-    rf:        float,
-    tax_rate:  float,
-) -> pd.DataFrame:
-    engine = RollingDCFEngine()
-    return engine.calculate(actuals, consensus, cfg, rf, tax_rate)
-
-
-# ---------------------------------------------------------------------------
-# 7. MOCK EXECUTION — Cyclical (Steel) + Start-up (IonQ-style)
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    pd.set_option("display.float_format", "{:.4f}".format)
-    pd.set_option("display.max_columns", 15)
-    pd.set_option("display.width", 160)
-
-    # ── FIRM A: Cyclical (Steel-proxy, pstdev ~10% -> triggers F1) ────────
-    cyclical_actuals = Financials(
-        revenue        = 22.0,
-        ebit_margin    = 0.20,          # current peak — will be instantly normalized
-        revenue_growth = 0.08,
-        cash           = 1.5,
-        debt           = 6.0,
-        shares         = 1.2,
-        hist_ebit_margins = [0.02, 0.18, 0.28, 0.20, 0.02, 0.22, 0.30, 0.04, 0.20, 0.08],
-        hist_rev_growth   = [0.12, -0.08, 0.18, 0.09, 0.05],
-    )
-    cyclical_consensus = [
-        ConsensusYear(year=2026, revenue=23.5, ebit_margin=0.16),
-        ConsensusYear(year=2027, revenue=24.8, ebit_margin=0.13),
-        ConsensusYear(year=2028, revenue=25.5, ebit_margin=0.11),
-    ]
-    RF_STEEL = 0.044
-
-    stage_c, cfg_c = classify_and_configure(
-        actuals=cyclical_actuals, rf=RF_STEEL,
-        industry_margin=0.12, sales_to_capital=1.2,
-        consensus=cyclical_consensus,
-    )
-
-    # ── FIRM B: Start-up (IonQ-style) ─────────────────────────────────────
-    startup_actuals = Financials(
-        revenue        = 0.043,
-        ebit_margin    = -4.0,
-        revenue_growth = 2.0,
-        cash           = 0.38,
-        debt           = 0.05,
-        shares         = 0.67,
-        hist_ebit_margins = [-3.5, -2.0, -4.0],
-        hist_rev_growth   = [0.80, 1.50, 2.00],
-    )
-    startup_consensus = [
-        ConsensusYear(year=2026, revenue=0.105, ebit_margin=-2.5),
-        ConsensusYear(year=2027, revenue=0.230, ebit_margin=-1.2),
-        ConsensusYear(year=2028, revenue=0.420, ebit_margin=-0.4),
-    ]
-    RF_STARTUP = 0.044
-
-    stage_s, cfg_s = classify_and_configure(
-        actuals=startup_actuals, rf=RF_STARTUP,
-        industry_margin=0.15, sales_to_capital=0.8,
-        consensus=startup_consensus,
-    )
-
-    for label, actuals, consensus, cfg, rf in [
-        ("CYCLICAL  [Steel-proxy: StdDev 6.1% -> Cyclical]",      cyclical_actuals, cyclical_consensus, cfg_c, RF_STEEL),
-        ("START-UP  [IonQ-style: -400% margin, 200% growth]",     startup_actuals,  startup_consensus,  cfg_s, RF_STARTUP),
-    ]:
-        print("=" * 80)
-        print(f"  {label}")
-        print("=" * 80)
-        print(f"  Stage          : {cfg.stage}")
-        print(f"  Horizon        : {cfg.horizon} yrs")
-        print(f"  WACC           : {cfg.wacc_start*100:.1f}% -> {cfg.wacc_end*100:.1f}%  (decay per year)")
-        print(f"  Terminal g     : {rf*100:.2f}%  (= rf)")
-        print(f"  Survival Prob  : {cfg.survival_prob:.0%}")
-        print(f"  Target Margin  : {cfg.target_margin*100:.1f}%")
-        print(f"  S/Capital      : {cfg.sales_to_capital}")
-        print(f"  Max Reinv/Rev  : {cfg.max_reinv_pct_rev*100:.0f}%")
-        print()
-
-        sched = build_full_schedule(actuals, consensus, cfg, rf, tax_rate=0.21)
-        cols  = ["revenue", "rev_growth", "ebit_margin", "nopat", "reinvestment", "fcf", "wacc", "source"]
-        print(sched[cols].to_string())
-        print()
-
-        targets = calculate_rolling_targets(actuals, consensus, cfg, rf, tax_rate=0.21)
-        print("  Rolling Target Prices:")
-        for yr, row in targets.iterrows():
-            print(
-                f"    {yr}E -> ${row['target_price']:>9.2f}"
-                f"  | EV ${row['ev']:.4f}"
-                f"  | PV(FCF) ${row['pv_fcfs']:.4f}"
-                f"  | PV(TV) ${row['pv_tv']:.4f}"
-                f"  | Cash ${row['base_cash']:.4f}"
-                f"  | Surv {row['survival_prob']:.0%}"
-                f"  | WACC {row['wacc_start_pct']:.1f}%->{row['wacc_end_pct']:.1f}%"
-            )
-        print()
+    _sanity_check()
