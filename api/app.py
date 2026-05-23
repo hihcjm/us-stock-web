@@ -960,9 +960,20 @@ def calc_rolling_dcf(hist_annual, estimates, life_cycle: int = 2):
             shares            = shares_b,
         )
 
+        # ── 역사적 매출 CAGR 계산 ──────────────────────────────────
+        rev_cagr = None
+        if len(rev_vals) >= 2:
+            n_yrs = len(rev_vals) - 1
+            if rev_vals[-1] and rev_vals[-1] > 0 and rev_vals[0] > 0:
+                raw_cagr = (rev_vals[0] / rev_vals[-1]) ** (1.0 / n_yrs) - 1.0
+                rev_cagr = max(-0.10, min(raw_cagr, 0.50))
+
         # ── DCF 엔진 실행 ───────────────────────────────────────────
         engine = DamodaranDCF(fin, rf=rf, erp=0.055, beta=beta)
-        result = engine.calculate_intrinsic_value(stage=life_cycle)
+        stage_kwargs = {}
+        if life_cycle == 2 and rev_cagr is not None:
+            stage_kwargs['rev_cagr'] = rev_cagr
+        result = engine.calculate_intrinsic_value(stage=life_cycle, **stage_kwargs)
 
         iv      = result.get('intrinsic_value', 0.0)
         upside  = round((iv - price) / price * 100, 1) if price and price > 0 else None
@@ -1004,7 +1015,7 @@ def calc_rolling_dcf(hist_annual, estimates, life_cycle: int = 2):
             'rf':              round(rf * 100, 2),
             'beta':            round(beta, 2),
             'erp':             5.5,
-            'terminal_g':      round(result.get('terminal_g', rf) * 100, 2) if result.get('terminal_g') is not None else round(rf * 100, 2),
+'terminal_g':      round(max(result.get('terminal_g') or rf, 0.0) * 100, 2),
             'tax_rate':        round(tax_rate * 100, 1),
             'shares':          round(shares_b, 3),
             'roic_base':       round(result.get('roic_base', 0) * 100, 2) if result.get('roic_base') is not None else None,

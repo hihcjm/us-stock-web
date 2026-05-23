@@ -312,6 +312,7 @@ class DamodaranDCF:
         self,
         g_override:    Optional[float] = None,
         roic_override: Optional[float] = None,
+        rev_cagr:      Optional[float] = None,
         **kwargs,
     ) -> dict:
         """
@@ -323,11 +324,26 @@ class DamodaranDCF:
 
         g_override    : Override implied growth rate
         roic_override : Override ROIC estimate
+        rev_cagr      : Historical revenue CAGR — used to correct for low RR bias
         """
         roic    = roic_override if roic_override is not None else self._base_roic()
         rr_base = self._base_reinvestment_rate()
-        g_base  = g_override if g_override is not None else (roic * rr_base)
-        g_base  = min(g_base, 0.35)
+        g_roic  = roic * rr_base   # pure implied growth
+
+        if g_override is not None:
+            g_base = g_override
+        elif rev_cagr is not None and rev_cagr > 0:
+            # Blend historical CAGR with implied growth (weight CAGR more)
+            g_base = rev_cagr * 0.6 + g_roic * 0.4
+        else:
+            g_base = g_roic
+
+        # Floor: at least half of WACC when RR is near zero (CapEx ≈ DA)
+        g_floor = self.wacc * 0.5
+        if g_base < g_floor and rev_cagr is None and g_override is None:
+            g_base = g_floor
+
+        g_base = min(g_base, 0.40)
 
         nopat_base    = self._nopat()
         current_nopat = nopat_base
@@ -356,7 +372,8 @@ class DamodaranDCF:
                 "fcf": round(fcf_t, 4), "pv_fcf": round(pv_t, 4), "phase": phase,
             })
 
-        g_terminal  = min(g_base, self.rf)
+        # terminal_g: strictly positive, capped at rf
+        g_terminal  = max(min(g_base, self.rf), 0.01)
         rr_terminal = g_terminal / max(self.wacc, 0.001)
         nopat_t11   = current_nopat * (1 + g_terminal)
         fcf_t11     = nopat_t11 * (1 - rr_terminal)
