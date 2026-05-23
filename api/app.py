@@ -827,31 +827,30 @@ def build_fin_table(hist_annual):
     body += '</tbody>'
     return f'<table class="financial-table">{header}{body}</table>'
 
-# ── 6-b. Rolling DCF (Damodaran v3, Lifecycle-Aware) ─────────────
+# ── 6-b. Rolling DCF (Damodaran 7-Stage Lifecycle) ───────────────
 def calc_rolling_dcf(hist_annual, estimates):
     """
-    yfinance + Stockanalysis 데이터 → rolling_dcf v3 모듈로 변환 후
-    calculate_rolling_targets() 호출.
+    yfinance + Stockanalysis 데이터 → rolling_dcf 7-Stage 모듈로 변환.
 
-    Lifecycle classification:
-      hyper_growth : EBIT margin < 0  OR  rev growth > 20%  (10-yr horizon, survival prob)
-      cyclical     : high hist EBIT margin variance          (10-yr horizon, mid-cycle convergence)
-      mature       : stable positive margin, growth <= 20%   (5-yr horizon)
+    7 Stages (strict sequential filter):
+      Pre-Revenue → Start-up → Cyclical → Declining
+      → High-Growth → Mature-Growth → Mature-Stable
 
-    Guards 1-4 자동 적용됨.
+    WACC decay: compounded discrete discount factors (per-year WACC schedule).
+    Terminal Value: FCF_final / (terminal_WACC - rf).
     """
     try:
         from api.rolling_dcf import (
-            Financials, ConsensusYear, DCFParams,
-            classify_firm, calculate_rolling_targets, build_full_schedule,
+            Financials, ConsensusYear,
+            classify_and_configure, calculate_rolling_targets, build_full_schedule,
         )
     except ImportError:
         try:
             import sys, os
             sys.path.insert(0, os.path.dirname(__file__))
             from rolling_dcf import (
-                Financials, ConsensusYear, DCFParams,
-                classify_firm, calculate_rolling_targets, build_full_schedule,
+                Financials, ConsensusYear,
+                classify_and_configure, calculate_rolling_targets, build_full_schedule,
             )
         except ImportError as e:
             return {"error": f"rolling_dcf import failed: {e}"}
@@ -871,6 +870,7 @@ def calc_rolling_dcf(hist_annual, estimates):
 
         beta  = safe_float(est.get('beta')) or 1.0
         price = safe_float(est.get('price') or hist_annual.get('price'))
+        tax   = 0.21
 
         # ── 최신 실적 추출 ──────────────────────────────────────────
         def get_latest(key):
@@ -878,31 +878,38 @@ def calc_rolling_dcf(hist_annual, estimates):
                 if v is not None: return v
             return None
 
-        def get_two_latest(key):
-            vals = [v for v in rows.get(key, []) if v is not None]
-            return (vals[0], vals[1]) if len(vals) >= 2 else (vals[0] if vals else None, None)
+        def get_all_valid(key):
+            return [v for v in rows.get(key, []) if v is not None]
 
-        rev_latest, rev_prev = get_two_latest('Revenue')
-        op_latest            = get_latest('Operating Income')
-        rev_latest           = rev_latest or 1.0
+        rev_vals = get_all_valid('Revenue')
+        op_vals  = get_all_valid('Operating Income')
+
+        rev_latest = rev_vals[0]  if rev_vals else 1.0
+        rev_prev   = rev_vals[1]  if len(rev_vals) >= 2 else None
+        op_latest  = op_vals[0]   if op_vals  else None
 
         ebit_margin    = (op_latest / rev_latest) if op_latest is not None and rev_latest else 0.0
         rev_growth_act = ((rev_latest / rev_prev) - 1) if rev_prev and rev_prev > 0 else 0.05
 
-        # ── 과거 EBIT 마진 시계열 (cyclical 감지용) ─────────────────
-        op_hist  = [v for v in rows.get('Operating Income', []) if v is not None]
-        rev_hist = [v for v in rows.get('Revenue', [])           if v is not None]
-        hist_ebit_margins = []
-        for op, rv in zip(op_hist, rev_hist):
+        # ── 과거 시계열 (분류기 입력) ────────────────────────────────
+        hist_ebit_margins: list[float] = []
+        for op, rv in zip(op_vals, rev_vals):
             if rv and rv != 0:
                 hist_ebit_margins.append(op / rv)
 
-        # Cash & Debt (yfinance raw info)
-        raw_info = est.get('_raw_info', {})
-        cash_b   = fmt_b(safe_float(raw_info.get('totalCash')))  or 0.0
-        debt_b   = fmt_b(safe_float(raw_info.get('totalDebt')))  or 0.0
+        # 매출 성장률 시계열 (최대 5년)
+        hist_rev_growth: list[float] = []
+        for i in range(len(rev_vals) - 1):
+            if rev_vals[i] and rev_vals[i+1] and rev_vals[i+1] > 0:
+                hist_rev_growth.append(rev_vals[i] / rev_vals[i+1] - 1)
+        hist_rev_growth = hist_rev_growth[:5]
 
-        # shares (B주)
+        # ── Cash & Debt ─────────────────────────────────────────────
+        raw_info = est.get('_raw_info', {})
+        cash_b   = fmt_b(safe_float(raw_info.get('totalCash'))) or 0.0
+        debt_b   = fmt_b(safe_float(raw_info.get('totalDebt'))) or 0.0
+
+        # ── Shares ──────────────────────────────────────────────────
         sh_raw   = safe_float(est.get('shares_outstanding'))
         shares_b = (sh_raw / 1e9) if sh_raw and sh_raw > 1e6 else None
         if not shares_b:
@@ -911,7 +918,7 @@ def calc_rolling_dcf(hist_annual, estimates):
                 shares_b = mktcap_b / price
         shares_b = shares_b or 1.0
 
-        # ── Financials (v3) ─────────────────────────────────────────
+        # ── Financials ──────────────────────────────────────────────
         actuals = Financials(
             revenue           = rev_latest,
             ebit_margin       = ebit_margin,
@@ -920,54 +927,24 @@ def calc_rolling_dcf(hist_annual, estimates):
             debt              = debt_b,
             shares            = shares_b,
             hist_ebit_margins = hist_ebit_margins,
+            hist_rev_growth   = hist_rev_growth,
         )
 
-        # ── 사전 분류로 파라미터 커스터마이징 ───────────────────────
-        firm_type_pre, _ = classify_firm(actuals)
-
-        # industry margin: 기본값
+        # ── Industry margin 추정 ────────────────────────────────────
         if ebit_margin <= 0:
             industry_margin = 0.15
         else:
             industry_margin = max(min((ebit_margin + 0.25) / 2, 0.35), 0.10)
 
-        # Sales-to-Capital
+        # ── Sales-to-Capital ────────────────────────────────────────
         capex_latest = get_latest('Capex') or rev_latest * 0.05
         stc = max(rev_latest / max(abs(capex_latest) * 5, 0.01), 0.5)
         stc = min(stc, 5.0)
 
-        # Hyper-growth: TAM cap (현재 매출 × 50배, 최소 $1B) & survival prob 0.7
-        survival = 1.0
-        tam_cap  = float('inf')
-        if firm_type_pre == 'hyper_growth':
-            survival = 0.70
-            tam_cap  = max(rev_latest * 50, 1.0)   # 현실적 시장 상한
-
-        # Cyclical: reinvestment cap 10%
-        max_capex_ratio = 0.10
-
-        # ── DCFParams (v3) ──────────────────────────────────────────
-        params = DCFParams(
-            risk_free_rate           = rf,
-            erp                      = 0.055,
-            beta                     = beta,
-            tax_rate                 = 0.21,
-            target_industry_margin   = industry_margin,
-            target_positive_margin   = max(industry_margin, 0.10),
-            sales_to_capital         = stc,
-            max_tam_revenue          = tam_cap,
-            probability_of_survival  = survival,
-            max_capex_to_sales       = max_capex_ratio,
-        )
-        # Guard 4: __post_init__ 에서 자동 적용
-
-        firm_type, horizon = classify_firm(actuals)
-        wacc_val = params.wacc
-
         # ── ConsensusYear 구성 ──────────────────────────────────────
         sa_rev = sa.get('rev', {})
         sa_eps = sa.get('eps', {})
-        consensus_years = []
+        consensus_years: list[ConsensusYear] = []
 
         for yr_int in (2026, 2027, 2028):
             fy_key = f'FY{yr_int}'
@@ -978,25 +955,29 @@ def calc_rolling_dcf(hist_annual, estimates):
                 base  = consensus_years[-1].revenue if consensus_years else rev_latest
                 rev_v = base * (1 + max(rev_growth_act, 0.03))
 
-            # EPS 기반 margin 추정 시도 (SA에 있을 경우)
-            eps_v  = sa_eps.get(fy_key, {}).get('avg')
-            if eps_v and rev_v and shares_b and shares_b > 0:
-                net_income_est = eps_v * shares_b
-                # EBIT ≈ NetIncome / (1 - tax) 근사
-                ebit_est       = net_income_est / (1 - 0.21)
-                margin_est     = ebit_est / rev_v if rev_v else ebit_margin
-                margin_est     = max(min(margin_est, 0.60), -5.0)  # 합리적 범위
+            eps_v = sa_eps.get(fy_key, {}).get('avg')
+            if eps_v and rev_v and shares_b > 0:
+                net_est    = eps_v * shares_b
+                ebit_est   = net_est / (1 - tax)
+                margin_est = max(min(ebit_est / rev_v, 0.60), -5.0)
             else:
-                margin_est = ebit_margin   # Guard 2가 수렴 처리
+                margin_est = ebit_margin
 
             consensus_years.append(ConsensusYear(
-                year        = yr_int,
-                revenue     = rev_v,
-                ebit_margin = margin_est,
+                year=yr_int, revenue=rev_v, ebit_margin=margin_est,
             ))
 
+        # ── 7단계 분류 + StageConfig ────────────────────────────────
+        stage, cfg = classify_and_configure(
+            actuals          = actuals,
+            rf               = rf,
+            industry_margin  = industry_margin,
+            sales_to_capital = stc,
+            consensus        = consensus_years,
+        )
+
         # ── FCF 스케줄 ──────────────────────────────────────────────
-        schedule_df = build_full_schedule(actuals, consensus_years, params)
+        schedule_df = build_full_schedule(actuals, consensus_years, cfg, rf, tax)
         schedule = []
         for yr, row in schedule_df.iterrows():
             schedule.append({
@@ -1007,42 +988,47 @@ def calc_rolling_dcf(hist_annual, estimates):
                 'nopat':        row.get('nopat'),
                 'reinvestment': row.get('reinvestment'),
                 'fcf':          row.get('fcf'),
+                'wacc':         row.get('wacc'),
                 'source':       row.get('source'),
             })
 
         # ── 롤링 타겟 ───────────────────────────────────────────────
-        targets_df = calculate_rolling_targets(actuals, consensus_years, params)
+        targets_df = calculate_rolling_targets(actuals, consensus_years, cfg, rf, tax)
         targets = []
         for yr, row in targets_df.iterrows():
             tp     = float(row['target_price'])
             upside = round((tp - price) / price * 100, 1) if price and price > 0 else None
             targets.append({
-                'year':          int(yr),
-                'firm_type':     row['firm_type'],
-                'horizon':       int(row['horizon']),
-                'proj_window':   row['proj_window'],
-                'survival_prob': float(row['survival_prob']),
-                'pv_fcfs_B':     float(row['pv_fcfs_B']),
-                'pv_tv_B':       float(row['pv_tv_B']),
-                'ev_B':          float(row['ev_B']),
-                'base_cash_B':   float(row['base_cash_B']),
-                'debt_B':        float(row['debt_B']),
-                'equity_B':      float(row['equity_B']),
-                'target_price':  round(tp, 2),
-                'upside_pct':    upside,
+                'year':           int(yr),
+                'stage':          row['stage'],
+                'horizon':        int(row['horizon']),
+                'proj_window':    row['proj_window'],
+                'survival_prob':  float(row['survival_prob']),
+                'wacc_start_pct': float(row['wacc_start_pct']),
+                'wacc_end_pct':   float(row['wacc_end_pct']),
+                'pv_fcfs_B':      float(row['pv_fcfs']),
+                'pv_tv_B':        float(row['pv_tv']),
+                'ev_B':           float(row['ev']),
+                'base_cash_B':    float(row['base_cash']),
+                'debt_B':         float(row['debt']),
+                'equity_B':       float(row['equity']),
+                'target_price':   round(tp, 2),
+                'upside_pct':     upside,
             })
 
         return {
-            'firm_type':       firm_type,
-            'horizon':         horizon,
-            'wacc':            round(wacc_val * 100, 2),
+            'stage':           stage,
+            'horizon':         cfg.horizon,
+            'wacc_start':      round(cfg.wacc_start * 100, 2),
+            'wacc_end':        round(cfg.wacc_end   * 100, 2),
             'rf':              round(rf * 100, 2),
             'beta':            round(beta, 2),
-            'terminal_g':      round(params.terminal_growth * 100, 2),
+            'terminal_g':      round(rf * 100, 2),
             'industry_margin': round(industry_margin * 100, 1),
-            'tax_rate':        round(params.tax_rate * 100, 1),
+            'tax_rate':        round(tax * 100, 1),
             'stc':             round(stc, 2),
-            'survival_prob':   round(survival, 2),
+            'survival_prob':   round(cfg.survival_prob, 2),
+            'target_margin':   round(cfg.target_margin * 100, 1),
             'schedule':        schedule,
             'targets':         targets,
         }
