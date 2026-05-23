@@ -959,7 +959,8 @@ def calc_rolling_dcf(hist_annual, estimates):
             if eps_v and rev_v and shares_b > 0:
                 net_est    = eps_v * shares_b
                 ebit_est   = net_est / (1 - tax)
-                margin_est = max(min(ebit_est / rev_v, 0.60), -5.0)
+                # Cap at -1.0 (EPS-derived margins can be -2x~-5x due to share count issues)
+                margin_est = max(min(ebit_est / rev_v, 0.60), -1.0)
             else:
                 margin_est = ebit_margin
 
