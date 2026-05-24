@@ -1,5 +1,4 @@
 from flask import Flask, render_template, request
-import yfinance as yf
 import pandas as pd
 import math
 import re
@@ -14,18 +13,24 @@ template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 't
 app = Flask(__name__, template_folder=template_dir)
 app.logger.setLevel(logging.INFO)
 
-# ── yfinance curl_cffi 세션 (Render IP 차단 우회) ─────────────────
-def _make_yf_session():
-    """curl_cffi를 사용해 브라우저 TLS 핑거프린트를 흉내내는 세션 반환.
-    curl_cffi 미설치 시 None 반환 → yfinance 기본 세션 사용."""
+# ── curl_cffi 세션으로 yfinance 전역 세션 패치 (Render IP rate-limit 우회) ──
+try:
+    from curl_cffi import requests as curl_requests
+    import yfinance as yf
+    _curl_session = curl_requests.Session(impersonate="chrome")
+    # yfinance 내부 전역 세션 교체
+    yf.utils.requests = _curl_session
     try:
-        from curl_cffi import requests as curl_requests
-        session = curl_requests.Session(impersonate="chrome")
-        return session
+        import yfinance.data as _yfd
+        _yfd.requests = _curl_session
     except Exception:
-        return None
-
-_YF_SESSION = _make_yf_session()
+        pass
+    _YF_SESSION = _curl_session
+    logger.info("curl_cffi session active — Yahoo Finance rate-limit bypass enabled")
+except Exception as _e:
+    import yfinance as yf
+    _YF_SESSION = None
+    logger.warning(f"curl_cffi not available, using default yfinance session: {_e}")
 
 # ── 유틸 ──────────────────────────────────────────────────────────
 def safe_float(val):
@@ -56,29 +61,37 @@ def get_series_val(series, key):
 
 # ── 1. 데이터 수집 ────────────────────────────────────────────────
 def fetch_yf_data(ticker_symbol):
-    """yfinance로 필요한 모든 데이터 수집.
-    curl_cffi 세션을 주입해 Render IP rate-limit 우회."""
+    """yfinance로 데이터 수집.
+    curl_cffi 세션을 session= 파라미터로 주입해 rate-limit 우회."""
+    # curl_cffi 세션이 있으면 yf.Ticker에 직접 전달
     if _YF_SESSION is not None:
         t = yf.Ticker(ticker_symbol, session=_YF_SESSION)
     else:
         t = yf.Ticker(ticker_symbol)
 
-    info = t.info
-    if not info or info.get('quoteType') not in ('EQUITY', 'ETF', None):
-        # quoteType 없어도 시도
-        if not info.get('shortName') and not info.get('longName'):
-            return None
+    try:
+        info = t.info
+    except Exception as e:
+        logger.error(f"t.info failed for {ticker_symbol}: {e}")
+        raise
 
-    income  = t.income_stmt      # 연간 손익계산서
-    cashflow = t.cashflow        # 연간 현금흐름표
-    balance  = t.balance_sheet   # 연간 재무상태표
+    if not info or (not info.get('shortName') and not info.get('longName')):
+        return None
+
+    try:
+        income   = t.income_stmt
+        cashflow = t.cashflow
+        balance  = t.balance_sheet
+    except Exception as e:
+        logger.error(f"Financial statements failed for {ticker_symbol}: {e}")
+        income = cashflow = balance = None
 
     return {
-        'ticker': ticker_symbol.upper(),
-        'info':   info,
-        'income': income,
-        'cashflow': cashflow,
-        'balance':  balance,
+        'ticker':     ticker_symbol.upper(),
+        'info':       info,
+        'income':     income,
+        'cashflow':   cashflow,
+        'balance':    balance,
         'ticker_obj': t,
     }
 
@@ -748,7 +761,18 @@ def build_fin_table(hist_annual):
 def analyze_us_stock(ticker_symbol):
     ticker_symbol = ticker_symbol.strip().upper()
 
-    raw = fetch_yf_data(ticker_symbol)
+    try:
+        raw = fetch_yf_data(ticker_symbol)
+    except Exception as e:
+        err_str = str(e)
+        if 'RateLimit' in err_str or 'Too Many' in err_str:
+            return {"error": (
+                "Yahoo Finance 요청 한도 초과(Rate Limit)로 데이터를 가져올 수 없습니다. "
+                "잠시 후(1~2분) 다시 시도해주세요."
+            )}
+        logger.error(f"fetch_yf_data failed for {ticker_symbol}: {e}")
+        return {"error": f"데이터 수집 오류: {e}"}
+
     if raw is None:
         return {"error": f"'{ticker_symbol}' not found on Yahoo Finance."}
 
@@ -809,15 +833,25 @@ def analyze_us_stock(ticker_symbol):
         return {"error": f"Analysis error: {traceback.format_exc()}"}
 
 # ── Flask 라우트 ─────────────────────────────────────────────────
+@app.route('/health')
+def health():
+    return 'OK', 200
+
 @app.route('/', methods=['GET', 'POST'])
 def index():
     result = None
     ticker = ""
-    if request.method == 'POST':
-        ticker = request.form.get('ticker', '').strip().upper()
-        if ticker:
-            result = analyze_us_stock(ticker)
-    return render_template('index.html', result=result, ticker=ticker)
+    try:
+        if request.method == 'POST':
+            ticker = request.form.get('ticker', '').strip().upper()
+            if ticker:
+                result = analyze_us_stock(ticker)
+        return render_template('index.html', result=result, ticker=ticker)
+    except Exception:
+        import traceback
+        logger.exception("Unhandled error in index route")
+        result = {"error": f"서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요.\n\n{traceback.format_exc()}"}
+        return render_template('index.html', result=result, ticker=ticker), 500
 
 if __name__ == '__main__':
     app.run(debug=True)
