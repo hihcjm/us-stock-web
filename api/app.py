@@ -1,4 +1,5 @@
 from flask import Flask, render_template, request
+import yfinance as yf
 import pandas as pd
 import math
 import re
@@ -11,26 +12,6 @@ logger = logging.getLogger(__name__)
 
 template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'templates')
 app = Flask(__name__, template_folder=template_dir)
-app.logger.setLevel(logging.INFO)
-
-# ── curl_cffi 세션으로 yfinance 전역 세션 패치 (Render IP rate-limit 우회) ──
-try:
-    from curl_cffi import requests as curl_requests
-    import yfinance as yf
-    _curl_session = curl_requests.Session(impersonate="chrome")
-    # yfinance 내부 전역 세션 교체
-    yf.utils.requests = _curl_session
-    try:
-        import yfinance.data as _yfd
-        _yfd.requests = _curl_session
-    except Exception:
-        pass
-    _YF_SESSION = _curl_session
-    logger.info("curl_cffi session active — Yahoo Finance rate-limit bypass enabled")
-except Exception as _e:
-    import yfinance as yf
-    _YF_SESSION = None
-    logger.warning(f"curl_cffi not available, using default yfinance session: {_e}")
 
 # ── 유틸 ──────────────────────────────────────────────────────────
 def safe_float(val):
@@ -61,30 +42,16 @@ def get_series_val(series, key):
 
 # ── 1. 데이터 수집 ────────────────────────────────────────────────
 def fetch_yf_data(ticker_symbol):
-    """yfinance로 데이터 수집.
-    curl_cffi 세션을 session= 파라미터로 주입해 rate-limit 우회."""
-    # curl_cffi 세션이 있으면 yf.Ticker에 직접 전달
-    if _YF_SESSION is not None:
-        t = yf.Ticker(ticker_symbol, session=_YF_SESSION)
-    else:
-        t = yf.Ticker(ticker_symbol)
-
-    try:
-        info = t.info
-    except Exception as e:
-        logger.error(f"t.info failed for {ticker_symbol}: {e}")
-        raise
+    """yfinance로 필요한 모든 데이터 수집."""
+    t = yf.Ticker(ticker_symbol)
+    info = t.info
 
     if not info or (not info.get('shortName') and not info.get('longName')):
         return None
 
-    try:
-        income   = t.income_stmt
-        cashflow = t.cashflow
-        balance  = t.balance_sheet
-    except Exception as e:
-        logger.error(f"Financial statements failed for {ticker_symbol}: {e}")
-        income = cashflow = balance = None
+    income   = t.income_stmt
+    cashflow = t.cashflow
+    balance  = t.balance_sheet
 
     return {
         'ticker':     ticker_symbol.upper(),
@@ -761,18 +728,7 @@ def build_fin_table(hist_annual):
 def analyze_us_stock(ticker_symbol):
     ticker_symbol = ticker_symbol.strip().upper()
 
-    try:
-        raw = fetch_yf_data(ticker_symbol)
-    except Exception as e:
-        err_str = str(e)
-        if 'RateLimit' in err_str or 'Too Many' in err_str:
-            return {"error": (
-                "Yahoo Finance 요청 한도 초과(Rate Limit)로 데이터를 가져올 수 없습니다. "
-                "잠시 후(1~2분) 다시 시도해주세요."
-            )}
-        logger.error(f"fetch_yf_data failed for {ticker_symbol}: {e}")
-        return {"error": f"데이터 수집 오류: {e}"}
-
+    raw = fetch_yf_data(ticker_symbol)
     if raw is None:
         return {"error": f"'{ticker_symbol}' not found on Yahoo Finance."}
 
@@ -789,7 +745,7 @@ def analyze_us_stock(ticker_symbol):
 
         # ── 요구수익률 r 계산 (rf + beta × ERP) ──────────────────────
         try:
-            tnx = yf.Ticker('^TNX', session=_YF_SESSION) if _YF_SESSION else yf.Ticker('^TNX')
+            tnx = yf.Ticker('^TNX')
             tnx_hist = tnx.history(period='5d')
             rf = float(tnx_hist['Close'].iloc[-1]) / 100 if not tnx_hist.empty else 0.044
         except:
