@@ -579,209 +579,96 @@ def calc_band(hist_annual, estimates):
 
     return results
 
-# ── 5. DCF ────────────────────────────────────────────────────────
-def calc_dcf(hist_annual, estimates, r=None):
+# ── 5. EPS 가치평가 3종 ──────────────────────────────────────────
+def calc_us_valuations(hist_annual, estimates, r):
     """
-    실제 FCF 기반 DCF.
-    - 과거 FCF > 0 연도 마진 평균
-    - Forward Revenue × 마진 → 추정 FCF
-    - 3개년 프로젝션 + 터미널 밸류
+    연도별 가치평가 3종 (한국 버전과 동일 로직, 단위는 달러):
+      1. EPS/r   : 내재가치 = EPS / r
+      2. RIM     : 내재가치 = BPS × (ROE / r)
+                   ROE는 yfinance 소수 (e.g. 1.41 = 141%) → 그대로 사용
+      3. Graham  : 내재가치 = EPS × (8.5 + 2×g) × (1 - r)
+                   g = 전체 연도(hist+fwd) ROE 평균 (소수, 0~30% 클램프)
+    r: 요구수익률 소수 (e.g. 0.13)
     """
-    try:
-        rows  = hist_annual['rows']
-        years = hist_annual['years']
-        price = hist_annual['price']
-        est   = estimates
+    rows  = hist_annual['rows']
+    years = list(hist_annual['years'])   # ['FY2022','FY2023',...]
+    price = hist_annual['price']
+    est   = estimates
 
-        # 할인율: rf(10Y Treasury) + beta × ERP(5.5%)
-        beta = est.get('beta') or 1.0
-        # risk-free rate
-        try:
-            tnx = yf.Ticker('^TNX')
-            tnx_hist = tnx.history(period='5d')
-            rf = float(tnx_hist['Close'].iloc[-1]) / 100 if not tnx_hist.empty else 0.044
-        except:
-            rf = 0.044
-        if r is None:
-            r = rf + beta * 0.055
-        g_terminal = 0.025
+    eps_list = rows.get('EPS (Diluted)', [])
+    bps_list = rows.get('BPS', [])
 
-        if r <= g_terminal:
-            return {"error": f"Discount rate ({r*100:.1f}%) ≤ terminal growth ({g_terminal*100:.1f}%)"}
+    # Forward EPS / BPS 추가 (컨센서스)
+    fwd_eps  = est.get('fwd_eps')           # 다음 12개월
+    next_eps = est.get('next_yr_eps')       # +1y
+    roe_raw  = est.get('roe')               # yfinance: 소수 (e.g. 1.41)
 
-        # ── 과거 FCF 마진 (FCF > 0 연도만) ──
-        hist_fcf_detail = []
-        hist_margins    = []
-        for i, yr in enumerate(years):
-            rev = rows['Revenue'][i]
-            fcf = rows['FCF'][i]
-            op_cf = rows['Op CF'][i]
-            capex = rows['Capex'][i]
-            if rev and rev > 0 and fcf is not None:
-                margin = fcf / rev
-                excluded = fcf <= 0
-                if not excluded:
-                    hist_margins.append(margin)
-                hist_fcf_detail.append({
-                    'year': yr,
-                    'op_cf': op_cf,
-                    'capex': capex,
-                    'fcf': fcf,
-                    'margin': round(margin * 100, 1),
-                    'src': 'Yahoo Finance',
-                    'excluded': excluded,
-                })
+    # ── g: 전체 연도 ROE 평균 ───────────────────────────────────────
+    # yfinance는 단일 trailing ROE만 제공 → 해당 값을 g로 사용
+    # 단, 0~30% 클램프
+    graham_g = None
+    if roe_raw is not None and roe_raw > 0:
+        graham_g = max(0.0, min(roe_raw, 0.30))   # 소수, 30% 상한
 
-        if len(hist_margins) < 1:
-            return {"error": "Not enough positive FCF history"}
+    # ── 연도별 행 구성 ──────────────────────────────────────────────
+    result_rows = []
 
-        avg_margin = sum(hist_margins) / len(hist_margins)
+    def make_row(yr, eps, bps, roe, is_fwd=False):
+        row = {'year': yr, 'is_fwd': is_fwd}
 
-        # ── Stockanalysis 장기 컨센서스 ──
-        sa = est.get('sa') or {}
-        sa_rev = sa.get('rev', {})   # {'FY2026': {'avg':486.8,'high':509.5,'low':445.8}, ...}
-        sa_eps = sa.get('eps', {})
+        # 1. EPS/r
+        val_eps_r = round(eps / r, 2) if eps and eps > 0 and r and r > 0 else None
+        gap_eps_r = round((val_eps_r - price) / price * 100, 1) \
+                    if val_eps_r and price and price > 0 else None
 
-        # ── 매출 성장률 (SA → yfinance → CAGR 순 우선순위) ──
-        rev_list = [v for v in rows['Revenue'] if v and v > 0]
-        curr_rev = est.get('curr_yr_rev')
-        next_rev = est.get('next_yr_rev')
+        # 2. RIM: BPS × (ROE / r)
+        val_rim = None; gap_rim = None
+        if bps and bps > 0 and roe and roe > 0 and r and r > 0:
+            val_rim = round(bps * (roe / r), 2)
+            if price and price > 0:
+                gap_rim = round((val_rim - price) / price * 100, 1)
 
-        # SA에서 가장 가까운 두 연도로 성장률 산출
-        sa_rev_avgs = sorted(
-            [(yr, d['avg']) for yr, d in sa_rev.items() if d.get('avg')],
-            key=lambda x: x[0]
-        )
-        if len(sa_rev_avgs) >= 2:
-            r0, r1 = sa_rev_avgs[0][1], sa_rev_avgs[-1][1]
-            n_yrs  = len(sa_rev_avgs) - 1
-            rev_growth = min((r1 / r0) ** (1 / n_yrs) - 1, 0.30)
-        elif curr_rev and next_rev and curr_rev > 0:
-            rev_growth = min((next_rev / curr_rev) - 1, 0.30)
-        elif len(rev_list) >= 2:
-            cagr   = (rev_list[-1] / rev_list[0]) ** (1 / (len(rev_list) - 1)) - 1
-            last_g = rev_list[-1] / rev_list[-2] - 1
-            rev_growth = min((cagr + last_g) / 2, 0.30)
-        else:
-            rev_growth = 0.08
+        # 3. Graham: EPS × (8.5 + 2×g) × (1 - r)
+        # g는 소수이므로 × 100 해서 % 정수로 변환 후 공식 적용
+        val_graham = None; gap_graham = None
+        if eps and eps > 0 and graham_g is not None and r and r > 0:
+            val_graham = round(eps * (8.5 + 2 * graham_g * 100) * (1 - r), 2)
+            if price and price > 0:
+                gap_graham = round((val_graham - price) / price * 100, 1)
 
-        # ── 프로젝션 기준 매출 (Forward Revenue 우선) ──
-        base_rev = curr_rev or (rev_list[-1] if rev_list else None)
+        row.update({
+            'eps':        round(eps, 2) if eps is not None else None,
+            'bps':        round(bps, 2) if bps is not None else None,
+            'roe':        round(roe * 100, 1) if roe is not None else None,  # % 표시용
+            'val_eps_r':  f"${val_eps_r:,.2f}" if val_eps_r is not None else '-',
+            'gap_eps_r':  gap_eps_r,
+            'val_rim':    f"${val_rim:,.2f}" if val_rim is not None else '-',
+            'gap_rim':    gap_rim,
+            'val_graham': f"${val_graham:,.2f}" if val_graham is not None else '-',
+            'gap_graham': gap_graham,
+        })
+        return row
 
-        # 발행주식수 (B주)
-        # 우선순위: ① est.shares_outstanding ② EPS/NetIncome 역산(최신 흑자연도) ③ 시총/주가
-        shares_b = None
-        sh_raw = safe_float(est.get('shares_outstanding'))  # 주 단위
-        if sh_raw and sh_raw > 1e6:
-            shares_b = sh_raw / 1e9
+    # 실적 연도
+    for i, yr in enumerate(years):
+        eps = eps_list[i] if i < len(eps_list) else None
+        bps = bps_list[i] if i < len(bps_list) else None
+        if eps is None and bps is None:
+            continue
+        result_rows.append(make_row(yr, eps, bps, roe_raw, is_fwd=False))
 
-        if not shares_b:
-            for i in range(len(years)):   # 최신(인덱스 0)부터
-                eps = rows['EPS (Diluted)'][i]
-                net = rows['Net Income'][i]
-                if eps and net and abs(eps) > 0.01 and net > 0:
-                    shares_b = net / eps   # B달러 / (달러/주) = B주
-                    break
+    # Forward EPS (컨센서스 추정)
+    if fwd_eps is not None:
+        result_rows.append(make_row('Fwd (12M)', fwd_eps, None, roe_raw, is_fwd=True))
+    if next_eps is not None:
+        result_rows.append(make_row('Next FY', next_eps, None, roe_raw, is_fwd=True))
 
-        if not shares_b and price:
-            mktcap_b = safe_float(est.get('market_cap'))   # B달러
-            if mktcap_b:
-                shares_b = mktcap_b / price   # B달러 / (달러/주) = B주
+    return {
+        'r':        round(r * 100, 2),
+        'graham_g': round(graham_g * 100, 1) if graham_g is not None else None,
+        'rows':     result_rows,
+    }
 
-        if not shares_b:
-            shares_b = 1.0
-
-        # ── 3개년 프로젝션 구성 ──
-        # SA 연도 순서: FY2025, FY2026, FY2027 ... 중 현재연도 이후만 사용
-        import datetime
-        current_fy_year = datetime.date.today().year  # 현재 캘린더 연도 기준
-
-        # SA rev 데이터에서 사용 가능한 연도(현재년도 이상) 추출
-        sa_proj_years = sorted([
-            (yr, d) for yr, d in sa_rev.items()
-            if d.get('avg') and int(yr.replace('FY','')) >= current_fy_year
-        ], key=lambda x: x[0])
-
-        fcf_years = []  # [(label, fcf_val, rev_val, rev_src, rev_range)]
-
-        if sa_proj_years:
-            # SA 데이터로 최대 3개년 채우기
-            for i, (fy_key, rev_d) in enumerate(sa_proj_years[:3]):
-                yr_int  = int(fy_key.replace('FY',''))
-                rev_val = rev_d['avg']
-                rev_hi  = rev_d.get('high')
-                rev_lo  = rev_d.get('low')
-                fcf_val = rev_val * avg_margin
-                label   = f"{fy_key} (컨센서스)"
-                rev_rng = f"${rev_lo}B–${rev_hi}B" if rev_lo and rev_hi else None
-                fcf_years.append((label, fcf_val, rev_val, 'Stockanalysis', rev_rng))
-
-            # SA가 3개 미만이면 성장률로 연장
-            last_rev = fcf_years[-1][2]
-            while len(fcf_years) < 3:
-                last_label = fcf_years[-1][0]
-                m = re.search(r'(\d{4})', last_label)
-                next_yr = int(m.group(1)) + 1 if m else current_fy_year + len(fcf_years)
-                rev_ext = last_rev * (1 + rev_growth)
-                fcf_ext = rev_ext * avg_margin
-                fcf_years.append((f"FY{next_yr} (추정)", fcf_ext, rev_ext, '성장률 연장', None))
-                last_rev = rev_ext
-        else:
-            # SA 없으면 기존 yfinance 방식
-            rev1 = base_rev
-            if rev1:
-                fcf_years.append(("FY+1 (추정)", rev1 * avg_margin, rev1, 'yfinance', None))
-            rev2 = next_rev or (base_rev * (1 + rev_growth) if base_rev else None)
-            if rev2:
-                fcf_years.append(("FY+2 (추정)", rev2 * avg_margin, rev2, 'yfinance', None))
-                rev3 = rev2 * (1 + rev_growth)
-                fcf_years.append(("FY+3 (추정)", rev3 * avg_margin, rev3, '성장률 연장', None))
-
-        if not fcf_years:
-            return {"error": "Cannot project FCF"}
-
-        # ── 할인 계산 ──
-        pv_fcfs  = []
-        cum_pv   = 0
-        for t_idx, (label, fcf_e, rev_e, rev_src, rev_rng) in enumerate(fcf_years):
-            n       = t_idx + 1
-            pv      = fcf_e / (1 + r) ** n
-            cum_pv += pv
-            tv      = fcf_e * (1 + g_terminal) / (r - g_terminal)
-            pv_tv   = tv / (1 + r) ** n
-            total_pv = cum_pv + pv_tv
-            # 주당 공정가치: total_pv(B달러) / shares_b(B주) = 달러/주
-            fv = total_pv / shares_b if shares_b else None
-            diff_v  = f"{fv - price:+.2f}"  if fv and price else None
-            diff_p  = f"{(fv - price)/price*100:+.1f}" if fv and price else None
-            pv_fcfs.append({
-                "year":       label,
-                "rev":        round(rev_e, 2),
-                "rev_src":    rev_src,
-                "rev_rng":    rev_rng,
-                "fcf":        round(fcf_e, 2),     # B달러
-                "pv":         round(pv, 2),
-                "pv_tv":      round(pv_tv, 2),
-                "total_pv":   round(total_pv, 2),
-                "fair_value": f"${fv:.2f}" if fv else "N/A",
-                "diff":       diff_v,
-                "diff_pct":   diff_p,
-            })
-
-        return {
-            "avg_fcf_margin": round(avg_margin * 100, 1),
-            "rev_growth":     round(rev_growth * 100, 1),
-            "r":              round(r * 100, 2),
-            "rf":             round(rf * 100, 2),
-            "beta":           round(beta, 2),
-            "g_terminal":     round(g_terminal * 100, 1),
-            "shares":         round(shares_b, 3),   # B주
-            "hist_fcf":       hist_fcf_detail,
-            "pv_fcfs":        pv_fcfs,
-        }
-    except Exception as e:
-        import traceback
-        return {"error": f"DCF error: {traceback.format_exc()}"}
 
 # ── 6. 재무 테이블 HTML ───────────────────────────────────────────
 def build_fin_table(hist_annual):
@@ -827,277 +714,8 @@ def build_fin_table(hist_annual):
     body += '</tbody>'
     return f'<table class="financial-table">{header}{body}</table>'
 
-# ── 6-b. Damodaran 4-Stage Life Cycle DCF ───────────────────────
-def calc_rolling_dcf(hist_annual, estimates, life_cycle: int = 2):
-    """
-    yfinance 데이터 → Damodaran 4-Stage Life Cycle DCF 엔진 호출.
-
-    life_cycle:
-      1 = Startup      (신생·초기성장기 — Top-Down TAM 기반)
-      2 = High Growth  (고성장기 — 3-Stage ROIC Fading)
-      3 = Mature       (성숙안정기 — Gordon Growth / 2-Stage)
-      4 = Decline      (쇠퇴기 — Liquidating CF)
-    """
-    try:
-        try:
-            from api.rolling_dcf import Financials, DamodaranDCF
-        except ImportError:
-            import sys, os
-            sys.path.insert(0, os.path.dirname(__file__))
-            from rolling_dcf import Financials, DamodaranDCF
-    except ImportError as e:
-        return {"error": f"rolling_dcf import failed: {e}"}
-
-    try:
-        import datetime
-        rows     = hist_annual['rows']
-        est      = estimates
-        raw_info = est.get('_raw_info', {})
-        price    = safe_float(est.get('price') or hist_annual.get('price'))
-
-        # ── rf 실시간 취득 ──────────────────────────────────────────
-        try:
-            tnx      = yf.Ticker('^TNX')
-            tnx_hist = tnx.history(period='5d')
-            rf = float(tnx_hist['Close'].iloc[-1]) / 100 if not tnx_hist.empty else 0.044
-        except:
-            rf = 0.044
-
-        beta = safe_float(est.get('beta')) or 1.0
-
-        # ── 최신 실적값 추출 ────────────────────────────────────────
-        def get_all_valid(key):
-            return [v for v in rows.get(key, []) if v is not None]
-
-        rev_vals  = get_all_valid('Revenue')
-        op_vals   = get_all_valid('Operating Income')
-        capex_vals= get_all_valid('Capex')
-        opcf_vals = get_all_valid('Op CF')
-
-        rev_latest  = rev_vals[0]  if rev_vals  else 1.0
-        op_latest   = op_vals[0]   if op_vals   else None
-        capex_latest= capex_vals[0] if capex_vals else 0.0
-        opcf_latest = opcf_vals[0] if opcf_vals  else None
-
-        ebit_latest = op_latest  if op_latest is not None else rev_latest * 0.10
-        ebit_margin = ebit_latest / rev_latest if rev_latest else 0.10
-
-        # ── D&A 추정 ───────────────────────────────────────────────
-        # yfinance cashflow에서 직접 조회 (Depreciation & Amortization)
-        net_vals = get_all_valid('Net Income')
-        net_latest = net_vals[0] if net_vals else None
-
-        da_latest = None
-        try:
-            cf_stmt = est.get('_raw_cashflow')
-            if cf_stmt is not None and not cf_stmt.empty:
-                for da_key in ('Depreciation And Amortization',
-                               'Reconciled Depreciation',
-                               'Depreciation Amortization Depletion'):
-                    if da_key in cf_stmt.index:
-                        v = safe_float(cf_stmt.loc[da_key].iloc[0])
-                        if v and v > 0:
-                            da_latest = fmt_b(v)
-                            break
-        except Exception:
-            pass
-
-        # Fallback: OpCF - NetIncome (간접법 CF 역산)
-        if da_latest is None or da_latest <= 0:
-            if opcf_latest is not None and net_latest is not None:
-                da_latest = max(opcf_latest - net_latest, 0.0)
-                if da_latest < capex_latest * 0.3:
-                    da_latest = capex_latest * 0.7   # sanity floor
-            else:
-                da_latest = capex_latest * 0.7
-        da_latest = max(da_latest or 0.0, rev_latest * 0.01)  # 최소 매출 1%
-
-        # ── Change in Working Capital ───────────────────────────────
-        change_wc = 0.0
-        try:
-            cf_stmt = est.get('_raw_cashflow')
-            if cf_stmt is not None and not cf_stmt.empty:
-                for wc_key in ('Change In Working Capital',
-                               'Changes In Working Capital',
-                               'Change In Other Working Capital'):
-                    if wc_key in cf_stmt.index:
-                        v = safe_float(cf_stmt.loc[wc_key].iloc[0])
-                        if v is not None:
-                            change_wc = fmt_b(v)
-                            change_wc = max(-rev_latest * 0.1,
-                                            min(change_wc, rev_latest * 0.1))
-                            break
-        except Exception:
-            pass
-        if change_wc == 0.0 and opcf_latest is not None and net_latest is not None:
-            approx_wc = opcf_latest - (net_latest or 0) - da_latest
-            change_wc = max(-rev_latest * 0.1, min(approx_wc, rev_latest * 0.1))
-
-        # ── 세율 추정 ──────────────────────────────────────────────
-        tax_rate = 0.21   # US 법정 기본
-        try:
-            income_stmt = est.get('_raw_income')
-            if income_stmt is not None and not income_stmt.empty:
-                for taxkey in ('Tax Provision', 'Income Tax Expense'):
-                    if taxkey in income_stmt.index:
-                        tax_prov = safe_float(income_stmt.loc[taxkey].iloc[0])
-                        for prekey in ('Pretax Income', 'Income Before Tax'):
-                            if prekey in income_stmt.index:
-                                pretax = safe_float(income_stmt.loc[prekey].iloc[0])
-                                if pretax and pretax > 0 and tax_prov and tax_prov > 0:
-                                    tax_rate = max(0.05, min(tax_prov / pretax, 0.40))
-                                break
-                        break
-        except Exception:
-            pass
-
-        # ── Balance Sheet: 현금 / 부채 ─────────────────────────────
-        # 1순위: yfinance info (totalCash, totalDebt)
-        # 2순위: balance_sheet DataFrame 직접 조회
-        cash_b = fmt_b(safe_float(raw_info.get('totalCash'))) or 0.0
-        debt_b = fmt_b(safe_float(raw_info.get('totalDebt'))) or 0.0
-
-        try:
-            bs_stmt = est.get('_raw_balance')
-            if bs_stmt is not None and not bs_stmt.empty:
-                # 현금이 없으면 BS에서 조회
-                if cash_b <= 0:
-                    for ck in ('Cash And Cash Equivalents',
-                               'Cash Cash Equivalents And Short Term Investments',
-                               'Cash And Short Term Investments'):
-                        if ck in bs_stmt.index:
-                            v = fmt_b(safe_float(bs_stmt.loc[ck].iloc[0]))
-                            if v and v > 0:
-                                cash_b = v
-                                break
-                # 부채가 없으면 BS에서 조회
-                if debt_b <= 0:
-                    for dk in ('Total Debt', 'Long Term Debt And Capital Lease Obligation',
-                               'Long Term Debt'):
-                        if dk in bs_stmt.index:
-                            v = fmt_b(safe_float(bs_stmt.loc[dk].iloc[0]))
-                            if v and v > 0:
-                                debt_b = v
-                                break
-        except Exception:
-            pass
-
-        # cash fallback: 시총의 5% (현금 최소 추정)
-        if cash_b <= 0:
-            mktcap_b = safe_float(est.get('market_cap')) or 0.0
-            cash_b = mktcap_b * 0.05 if mktcap_b > 0 else 0.0
-
-        # minority interest: US firms 대부분 0
-        minority_b = 0.0
-
-        # ── Shares (B-shares) ───────────────────────────────────────
-        shares_b = None
-        sh_raw = safe_float(est.get('shares_outstanding'))
-        if sh_raw and sh_raw > 1e6:
-            shares_b = sh_raw / 1e9
-
-        if not shares_b:
-            eps_vals = get_all_valid('EPS (Diluted)')
-            for net, eps in zip(net_vals, eps_vals):
-                if net and eps and abs(eps) > 0.01 and net > 0:
-                    shares_b = net / eps   # B-USD / (USD/share) = B-shares
-                    break
-
-        if not shares_b and price:
-            mktcap_b = safe_float(est.get('market_cap'))
-            if mktcap_b:
-                shares_b = mktcap_b / price
-
-        shares_b = shares_b or 1.0
-
-        # ── Financials 객체 구성 ───────────────────────────────────
-        fin = Financials(
-            revenue           = rev_latest,
-            ebit              = ebit_latest,
-            ebit_margin       = ebit_margin,
-            tax_rate          = tax_rate,
-            depr_amort        = da_latest,
-            capex             = capex_latest,
-            change_wc         = change_wc,
-            cash_st           = cash_b,
-            debt              = debt_b,
-            minority_interest = minority_b,
-            shares            = shares_b,
-        )
-
-        # ── 역사적 매출 CAGR 계산 ──────────────────────────────────
-        rev_cagr = None
-        if len(rev_vals) >= 2:
-            n_yrs = len(rev_vals) - 1
-            if rev_vals[-1] and rev_vals[-1] > 0 and rev_vals[0] > 0:
-                raw_cagr = (rev_vals[0] / rev_vals[-1]) ** (1.0 / n_yrs) - 1.0
-                rev_cagr = max(-0.10, min(raw_cagr, 0.50))
-
-        # ── DCF 엔진 실행 ───────────────────────────────────────────
-        engine = DamodaranDCF(fin, rf=rf, erp=0.055, beta=beta)
-        stage_kwargs = {}
-        if life_cycle == 2 and rev_cagr is not None:
-            stage_kwargs['rev_cagr'] = rev_cagr
-        result = engine.calculate_intrinsic_value(stage=life_cycle, **stage_kwargs)
-
-        iv      = result.get('intrinsic_value', 0.0)
-        upside  = round((iv - price) / price * 100, 1) if price and price > 0 else None
-
-        stage_names = {
-            1: 'Startup',
-            2: 'High Growth',
-            3: 'Mature',
-            4: 'Decline',
-        }
-        stage_name = stage_names.get(life_cycle, 'High Growth')
-
-        # FCFF 스케줄 정리 (display용 반올림)
-        schedule = []
-        for row in result.get('fcff_schedule', []):
-            schedule.append({
-                'year':       row.get('year'),
-                'revenue':    round(row['revenue'], 2) if row.get('revenue') is not None else None,
-                'nopat':      round(row['nopat'],   4) if row.get('nopat')   is not None else None,
-                'fcf':        round(row['fcf'],     4) if row.get('fcf')     is not None else None,
-                'pv_fcf':     round(row['pv_fcf'],  4) if row.get('pv_fcf')  is not None else None,
-                'reinv_rate': round(row.get('reinv_rate', 0), 4),
-                'growth_g':   round(row['growth_g'], 4) if row.get('growth_g') is not None else None,
-                'roic':       round(row['roic'],    4) if row.get('roic')    is not None else None,
-                'phase':      row.get('phase', ''),
-            })
-
-        return {
-            'life_cycle':      life_cycle,
-            'stage':           stage_name,
-            'intrinsic_value': round(iv, 2),
-            'upside_pct':      upside,
-            'ev':              round(result.get('ev', 0), 2),
-            'equity_value':    round(result.get('equity_value', 0), 2),
-            'cash_st':         round(result.get('cash_st', 0), 2),
-            'debt':            round(result.get('debt', 0), 2),
-            'wacc':            round(result.get('wacc', 0) * 100, 2),
-            'coe':             round(result.get('coe', 0)  * 100, 2),
-            'rf':              round(rf * 100, 2),
-            'beta':            round(beta, 2),
-            'erp':             5.5,
-'terminal_g':      round(max(result.get('terminal_g') or rf, 0.0) * 100, 2),
-            'tax_rate':        round(tax_rate * 100, 1),
-            'shares':          round(shares_b, 3),
-            'roic_base':       round(result.get('roic_base', 0) * 100, 2) if result.get('roic_base') is not None else None,
-            'g_base':          round(result.get('g_base', 0) * 100, 2)    if result.get('g_base')    is not None else None,
-            'pv_stage1':       round(result.get('pv_stage1', 0), 2),
-            'pv_stage2':       round(result.get('pv_stage2', 0), 2),
-            'pv_terminal_value': round(result.get('pv_terminal_value', 0), 2),
-            'schedule':        schedule,
-        }
-
-    except Exception:
-        import traceback
-        return {"error": traceback.format_exc()}
-
-
 # ── 7. 메인 분석 함수 ────────────────────────────────────────────
-def analyze_us_stock(ticker_symbol, life_cycle: int = 2):
+def analyze_us_stock(ticker_symbol):
     ticker_symbol = ticker_symbol.strip().upper()
 
     raw = fetch_yf_data(ticker_symbol)
@@ -1113,16 +731,21 @@ def analyze_us_stock(ticker_symbol, life_cycle: int = 2):
         if hist is None:
             return {"error": "Failed to parse financial history."}
 
-        est     = get_estimates(raw)
-        # raw 재무제표 데이터를 est에 주입 (DCF 엔진에서 D&A, ΔWC, 세율, 현금/부채 정밀 조회용)
-        est['_raw_info']     = raw['info']
-        est['_raw_income']   = raw.get('income')
-        est['_raw_cashflow'] = raw.get('cashflow')
-        est['_raw_balance']  = raw.get('balance')
-        dcf     = calc_dcf(hist, est)
-        band    = calc_band(hist, est)
-        fin_tbl = build_fin_table(hist)
-        rdcf    = calc_rolling_dcf(hist, est, life_cycle=life_cycle)
+        est = get_estimates(raw)
+
+        # ── 요구수익률 r 계산 (rf + beta × ERP) ──────────────────────
+        try:
+            tnx = yf.Ticker('^TNX')
+            tnx_hist = tnx.history(period='5d')
+            rf = float(tnx_hist['Close'].iloc[-1]) / 100 if not tnx_hist.empty else 0.044
+        except:
+            rf = 0.044
+        beta  = safe_float(est.get('beta')) or 1.0
+        r_val = rf + beta * 0.055
+
+        band       = calc_band(hist, est)
+        fin_tbl    = build_fin_table(hist)
+        valuation  = calc_us_valuations(hist, est, r=r_val)
 
         return {
             "ticker":     ticker_symbol,
@@ -1140,13 +763,16 @@ def analyze_us_stock(ticker_symbol, life_cycle: int = 2):
             "roe_pct":    est.get('roe_pct'),
             "roa_pct":    est.get('roa_pct'),
             "de_ratio":   est.get('de_ratio'),
+            "r_info": {
+                "rf":   f"{rf*100:.2f}",
+                "beta": f"{beta:.2f}",
+                "r":    f"{r_val*100:.2f}",
+            },
             "raw_table":  fin_tbl,
             "est":        est,
             "sa":         est.get('sa'),
-            "dcf":        dcf,
             "band":       band,
-            "rdcf":       rdcf,
-            "life_cycle": life_cycle,
+            "valuation":  valuation,
         }
     except Exception as e:
         import traceback
@@ -1155,20 +781,13 @@ def analyze_us_stock(ticker_symbol, life_cycle: int = 2):
 # ── Flask 라우트 ─────────────────────────────────────────────────
 @app.route('/', methods=['GET', 'POST'])
 def index():
-    result     = None
-    ticker     = ""
-    life_cycle = 2
+    result = None
+    ticker = ""
     if request.method == 'POST':
         ticker = request.form.get('ticker', '').strip().upper()
-        try:
-            life_cycle = int(request.form.get('life_cycle', 2))
-            if life_cycle not in (1, 2, 3, 4):
-                life_cycle = 2
-        except (ValueError, TypeError):
-            life_cycle = 2
         if ticker:
-            result = analyze_us_stock(ticker, life_cycle=life_cycle)
-    return render_template('index.html', result=result, ticker=ticker, life_cycle=life_cycle)
+            result = analyze_us_stock(ticker)
+    return render_template('index.html', result=result, ticker=ticker)
 
 if __name__ == '__main__':
     app.run(debug=True)

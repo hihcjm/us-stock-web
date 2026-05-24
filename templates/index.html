@@ -413,15 +413,6 @@
            placeholder="예: AAPL, NVDA, MSFT" autocomplete="off" autofocus>
     <button type="submit">분석</button>
     <span class="hint">미국 주식 티커를 입력하세요</span>
-    <div class="lifecycle-console" style="margin-left:auto;">
-      <span class="lc-label">&gt; DCF 생애주기 단계:</span>
-      <select name="life_cycle">
-        <option value="1" {% if life_cycle == 1 %}selected{% endif %}>① 신생·초기성장기 (Startup — Top-Down TAM)</option>
-        <option value="2" {% if life_cycle == 2 or not life_cycle %}selected{% endif %}>② 고성장기 (High Growth — ROIC Fading)</option>
-        <option value="3" {% if life_cycle == 3 %}selected{% endif %}>③ 성숙안정기 (Mature — Gordon Growth)</option>
-        <option value="4" {% if life_cycle == 4 %}selected{% endif %}>④ 쇠퇴기 (Decline — Liquidating CF)</option>
-      </select>
-    </div>
   </form>
 </div>
 
@@ -836,154 +827,138 @@
   {% endif %}
 
   {# ── Damodaran 4-Stage Life Cycle DCF ── #}
-  {% if result.rdcf and not result.rdcf.error %}
-  {% set rd = result.rdcf %}
-  {% set stage_ko = {
-    'Startup':     '① 신생·초기성장기',
-    'High Growth': '② 고성장기',
-    'Mature':      '③ 성숙안정기',
-    'Decline':     '④ 쇠퇴기'
-  } %}
-  {% set stage_class = {
-    'Startup':     'rdcf-startup',
-    'High Growth': 'rdcf-high-growth',
-    'Mature':      'rdcf-mature',
-    'Decline':     'rdcf-decline'
-  } %}
-  {% set stage_desc = {
-    'Startup':     'Top-Down TAM 기반 매출 추정 · 실패확률 반영',
-    'High Growth': '3단계 Bottom-Up ROIC Fading (고성장→전환→영구)',
-    'Mature':      'Gordon Growth 2-Stage · 영구성장률 min(2.5%, rf)',
-    'Decline':     'Liquidating CF · CapEx < D&A → 음의 재투자'
-  } %}
-  {% set ft_label = stage_ko.get(rd.stage, rd.stage) %}
-  {% set ft_class = stage_class.get(rd.stage, 'rdcf-mature') %}
-  {% set ft_desc  = stage_desc.get(rd.stage, '') %}
+  {# ── 가치평가 3종 ── #}
+  {% if result.valuation and result.valuation.rows %}
+  {% set vl = result.valuation %}
 
+  {# 카드 1: EPS/r #}
   <div class="card">
-    <div class="card-header">🎯 Damodaran 4-Stage Life Cycle DCF 적정주가
+    <div class="card-header">📊 EPS/r 내재가치
       <span style="font-size:11px;font-weight:400;color:#718096;margin-left:8px;">
-        ERP 5.5% (US) · rf {{ rd.rf }}% · FCFF = NOPAT(1−RR)
+        내재가치 = EPS ÷ r &nbsp;·&nbsp; r = {{ vl.r }}%
+        {% if result.r_info %}(rf {{ result.r_info.rf }}% + β{{ result.r_info.beta }} × ERP 5.5%){% endif %}
       </span>
     </div>
-
-    {# ── 적정주가 메인 카드 ── #}
-    <div class="rdcf-iv-card">
-      <div class="iv-main">
-        <div class="iv-label">
-          <span class="rdcf-badge {{ ft_class }}" style="font-size:12px;padding:4px 12px;margin-bottom:8px;">
-            {{ ft_label }}
-          </span>
-        </div>
-        <div class="iv-price">${{ rd.intrinsic_value }}</div>
-        {% if rd.upside_pct is not none %}
-        <div class="{% if rd.upside_pct >= 0 %}iv-upside-up{% else %}iv-upside-down{% endif %}">
-          {% if rd.upside_pct >= 0 %}▲ +{{ rd.upside_pct }}%{% else %}▼ {{ rd.upside_pct }}%{% endif %}
-          &nbsp;<span style="font-size:12px;font-weight:400;opacity:.8;">현재가 ${{ result.price_raw | round(2) }} 대비</span>
-        </div>
-        {% endif %}
-        <div style="margin-top:12px;font-size:11px;opacity:.7;">{{ ft_desc }}</div>
-      </div>
-      <div class="iv-meta">
-        <div class="iv-meta-row"><span class="k">Enterprise Value</span><span class="v">${{ rd.ev }}B</span></div>
-        <div class="iv-meta-row"><span class="k">+ 현금·단기투자</span><span class="v">+${{ rd.cash_st }}B</span></div>
-        <div class="iv-meta-row"><span class="k">− 총부채</span><span class="v">−${{ rd.debt }}B</span></div>
-        <div class="iv-meta-row"><span class="k">내재 시가총액</span><span class="v">${{ rd.equity_value }}B</span></div>
-        <div class="iv-meta-row"><span class="k">발행주식수</span><span class="v">{{ rd.shares }}B주</span></div>
-        <div class="iv-meta-row" style="margin-top:4px;"><span class="k">WACC</span><span class="v">{{ rd.wacc }}%</span></div>
-        <div class="iv-meta-row"><span class="k">CoE (rf+β×ERP)</span><span class="v">{{ rd.coe }}%</span></div>
-        <div class="iv-meta-row"><span class="k">rf / ERP / β</span><span class="v">{{ rd.rf }}% / {{ rd.erp }}% / {{ rd.beta }}</span></div>
-        <div class="iv-meta-row"><span class="k">영구성장률 g</span><span class="v">{{ rd.terminal_g }}%</span></div>
-        <div class="iv-meta-row"><span class="k">세율</span><span class="v">{{ rd.tax_rate }}%</span></div>
-        {% if rd.roic_base is not none %}
-        <div class="iv-meta-row"><span class="k">기초 ROIC</span><span class="v">{{ rd.roic_base }}%</span></div>
-        {% endif %}
-        {% if rd.g_base is not none %}
-        <div class="iv-meta-row"><span class="k">기초 성장률 g</span><span class="v">{{ rd.g_base }}%</span></div>
-        {% endif %}
-        {% if rd.pv_terminal_value %}
-        <div class="iv-meta-row" style="margin-top:4px;border-top:1px solid rgba(255,255,255,.2);">
-          <span class="k">PV(TV)</span><span class="v">${{ rd.pv_terminal_value }}B</span>
-        </div>
-        {% endif %}
-      </div>
-    </div>
-
-    {# ── FCFF 스케줄 ── #}
-    {% if rd.schedule %}
-    <div style="padding:4px 20px 0;">
-      <div style="font-size:12px;font-weight:700;color:#4a5568;margin-bottom:8px;">
-        FCFF 연도별 스케줄
-        <span style="font-weight:400;color:#a0aec0;margin-left:6px;">
-          <span style="background:#fff5f5;padding:1px 6px;border-radius:3px;color:#9b2335;">고성장</span>
-          &nbsp;
-          <span style="background:#fffbeb;padding:1px 6px;border-radius:3px;color:#b7791f;">전환</span>
-          &nbsp;
-          <span style="background:#f0fff4;padding:1px 6px;border-radius:3px;color:#276749;">안정</span>
-        </span>
-      </div>
-      <div style="overflow-x:auto; margin-bottom:16px;">
-        <table class="rdcf-schedule-table">
-          <thead>
-            <tr>
-              <th style="text-align:left;">연도</th>
-              {% if rd.stage != 'Startup' and rd.schedule[0].growth_g is not none %}
-              <th>성장률 g</th>
-              {% endif %}
-              {% if rd.schedule[0].roic is not none %}
-              <th>ROIC</th>
-              {% endif %}
-              <th>재투자율 RR</th>
-              <th>NOPAT (B$)</th>
-              <th>FCFF (B$)</th>
-              <th>PV(FCFF) (B$)</th>
-              <th>단계</th>
-            </tr>
-          </thead>
-          <tbody>
-          {% for s in rd.schedule %}
-          {% set phase_class = 'phase-' + (s.phase | replace('_', '-') | replace('high-growth','high') | replace('near-stable','stable') | replace('gordon-growth','stable') | replace('liquidating','decline') | default('stable')) %}
-          <tr class="{{ phase_class }}">
-            <td>{{ s.year }}</td>
-            {% if rd.stage != 'Startup' and rd.schedule[0].growth_g is not none %}
-            <td>{% if s.growth_g is not none %}{{ (s.growth_g * 100) | round(1) }}%{% else %}—{% endif %}</td>
-            {% endif %}
-            {% if rd.schedule[0].roic is not none %}
-            <td>{% if s.roic is not none %}{{ (s.roic * 100) | round(1) }}%{% else %}—{% endif %}</td>
-            {% endif %}
-            <td>{% if s.reinv_rate is not none %}{{ (s.reinv_rate * 100) | round(1) }}%{% else %}—{% endif %}</td>
-            <td>{% if s.nopat is not none %}{{ s.nopat | round(3) }}{% else %}—{% endif %}</td>
-            <td style="font-weight:700;">{% if s.fcf is not none %}{{ s.fcf | round(3) }}{% else %}—{% endif %}</td>
-            <td>{% if s.pv_fcf is not none %}{{ s.pv_fcf | round(3) }}{% else %}—{% endif %}</td>
-            <td style="font-size:10px;">
-              {% if s.phase == 'high_growth' %}<span style="color:#9b2335;">고성장</span>
-              {% elif s.phase == 'transition' %}<span style="color:#b7791f;">전환</span>
-              {% elif s.phase in ('near_stable', 'gordon_growth') %}<span style="color:#276749;">안정</span>
-              {% elif s.phase == 'ramp' %}<span style="color:#744210;">램프업</span>
-              {% elif s.phase == 'decline' %}<span style="color:#718096;">쇠퇴</span>
-              {% else %}<span style="color:#a0aec0;">{{ s.phase }}</span>
-              {% endif %}
-            </td>
+    <div style="overflow-x:auto;padding:0 20px 16px;">
+      <table class="financial-table" style="min-width:420px;">
+        <thead>
+          <tr>
+            <th>연도</th>
+            <th style="text-align:right;">EPS ($)</th>
+            <th style="text-align:right;">내재가치 ($)</th>
+            <th style="text-align:right;">괴리율</th>
           </tr>
-          {% endfor %}
-          </tbody>
-        </table>
-      </div>
+        </thead>
+        <tbody>
+        {% for row in vl.rows %}
+        <tr {% if row.is_fwd %}style="background:#fffbeb;"{% endif %}>
+          <td>{{ row.year }}</td>
+          <td style="text-align:right;">{% if row.eps is not none %}{{ row.eps }}{% else %}—{% endif %}</td>
+          <td style="text-align:right;font-weight:600;">{{ row.val_eps_r }}</td>
+          <td style="text-align:right;">
+            {% if row.gap_eps_r is not none %}
+            <span style="color:{% if row.gap_eps_r >= 0 %}#276749{% else %}#c53030{% endif %};font-weight:600;">
+              {% if row.gap_eps_r >= 0 %}▲ +{{ row.gap_eps_r }}%{% else %}▼ {{ row.gap_eps_r }}%{% endif %}
+            </span>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
     </div>
-    {% endif %}
-
-    <p style="padding:6px 20px 14px;color:#a0aec0;font-size:11px;">
-      Damodaran 4-Stage Life Cycle DCF ({{ ft_label }}) —
-      US ERP 5.5% · rf {{ rd.rf }}% · WACC {{ rd.wacc }}% ·
-      g_terminal = min(g_base, rf) · IC = max(D&A×5, Rev×0.5)
+    <p style="padding:0 20px 12px;color:#a0aec0;font-size:11px;">
+      내재가치 = EPS($) / r · r = rf + β × ERP(5.5%) · 괴리율 양수(▲) = 저평가, 음수(▼) = 고평가
+      · 연한 배경 = Forward 추정치
     </p>
   </div>
-  {% elif result.rdcf and result.rdcf.error %}
+
+  {# 카드 2: RIM #}
   <div class="card">
-    <div class="card-header">🎯 Damodaran 4-Stage Life Cycle DCF</div>
-    <p style="padding:14px 20px;color:#e53e3e;font-size:13px;white-space:pre-wrap;font-family:monospace;">{{ result.rdcf.error[:500] }}</p>
+    <div class="card-header">📊 RIM 잔여이익모델 내재가치
+      <span style="font-size:11px;font-weight:400;color:#718096;margin-left:8px;">
+        내재가치 = BPS × (ROE ÷ r) &nbsp;·&nbsp; r = {{ vl.r }}%
+      </span>
+    </div>
+    <div style="overflow-x:auto;padding:0 20px 16px;">
+      <table class="financial-table" style="min-width:520px;">
+        <thead>
+          <tr>
+            <th>연도</th>
+            <th style="text-align:right;">BPS ($)</th>
+            <th style="text-align:right;">ROE (%)</th>
+            <th style="text-align:right;">내재가치 ($)</th>
+            <th style="text-align:right;">괴리율</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for row in vl.rows %}
+        <tr {% if row.is_fwd %}style="background:#fffbeb;"{% endif %}>
+          <td>{{ row.year }}</td>
+          <td style="text-align:right;">{% if row.bps is not none %}{{ row.bps }}{% else %}—{% endif %}</td>
+          <td style="text-align:right;">{% if row.roe is not none %}{{ row.roe }}%{% else %}—{% endif %}</td>
+          <td style="text-align:right;font-weight:600;">{{ row.val_rim }}</td>
+          <td style="text-align:right;">
+            {% if row.gap_rim is not none %}
+            <span style="color:{% if row.gap_rim >= 0 %}#276749{% else %}#c53030{% endif %};font-weight:600;">
+              {% if row.gap_rim >= 0 %}▲ +{{ row.gap_rim }}%{% else %}▼ {{ row.gap_rim }}%{% endif %}
+            </span>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p style="padding:0 20px 12px;color:#a0aec0;font-size:11px;">
+      내재가치 = BPS($) × (ROE / r) · ROE는 yfinance trailing ROE(소수) 사용
+      · 괴리율 양수(▲) = 저평가, 음수(▼) = 고평가
+    </p>
   </div>
-  {% endif %}
+
+  {# 카드 3: Graham #}
+  <div class="card">
+    <div class="card-header">📊 벤저민 그레이엄 내재가치
+      <span style="font-size:11px;font-weight:400;color:#718096;margin-left:8px;">
+        내재가치 = EPS × (8.5 + 2×g) × (1 − r)
+        {% if vl.graham_g is not none %}&nbsp;·&nbsp; g = {{ vl.graham_g }}% (trailing ROE){% endif %}
+      </span>
+    </div>
+    <div style="overflow-x:auto;padding:0 20px 16px;">
+      <table class="financial-table" style="min-width:420px;">
+        <thead>
+          <tr>
+            <th>연도</th>
+            <th style="text-align:right;">EPS ($)</th>
+            <th style="text-align:right;">내재가치 ($)</th>
+            <th style="text-align:right;">괴리율</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for row in vl.rows %}
+        <tr {% if row.is_fwd %}style="background:#fffbeb;"{% endif %}>
+          <td>{{ row.year }}</td>
+          <td style="text-align:right;">{% if row.eps is not none %}{{ row.eps }}{% else %}—{% endif %}</td>
+          <td style="text-align:right;font-weight:600;">{{ row.val_graham }}</td>
+          <td style="text-align:right;">
+            {% if row.gap_graham is not none %}
+            <span style="color:{% if row.gap_graham >= 0 %}#276749{% else %}#c53030{% endif %};font-weight:600;">
+              {% if row.gap_graham >= 0 %}▲ +{{ row.gap_graham }}%{% else %}▼ {{ row.gap_graham }}%{% endif %}
+            </span>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p style="padding:0 20px 12px;color:#a0aec0;font-size:11px;">
+      내재가치 = EPS($) × (8.5 + 2×g) × (1 − r) · 8.5 = 무성장 기본 PER · g = trailing ROE(%, 0~30% 클램프)
+      · r = 요구수익률 · EPS 음수 연도 제외 · 괴리율 양수(▲) = 저평가, 음수(▼) = 고평가
+    </p>
+  </div>
+
+  {% endif %} {# valuation #}
 
   {% endif %} {# result.error #}
 {% endif %} {# result #}
