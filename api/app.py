@@ -5,10 +5,27 @@ import math
 import re
 import os
 import requests
+import logging
 from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
 
 template_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'templates')
 app = Flask(__name__, template_folder=template_dir)
+app.logger.setLevel(logging.INFO)
+
+# ── yfinance curl_cffi 세션 (Render IP 차단 우회) ─────────────────
+def _make_yf_session():
+    """curl_cffi를 사용해 브라우저 TLS 핑거프린트를 흉내내는 세션 반환.
+    curl_cffi 미설치 시 None 반환 → yfinance 기본 세션 사용."""
+    try:
+        from curl_cffi import requests as curl_requests
+        session = curl_requests.Session(impersonate="chrome")
+        return session
+    except Exception:
+        return None
+
+_YF_SESSION = _make_yf_session()
 
 # ── 유틸 ──────────────────────────────────────────────────────────
 def safe_float(val):
@@ -39,8 +56,13 @@ def get_series_val(series, key):
 
 # ── 1. 데이터 수집 ────────────────────────────────────────────────
 def fetch_yf_data(ticker_symbol):
-    """yfinance로 필요한 모든 데이터 수집."""
-    t = yf.Ticker(ticker_symbol)
+    """yfinance로 필요한 모든 데이터 수집.
+    curl_cffi 세션을 주입해 Render IP rate-limit 우회."""
+    if _YF_SESSION is not None:
+        t = yf.Ticker(ticker_symbol, session=_YF_SESSION)
+    else:
+        t = yf.Ticker(ticker_symbol)
+
     info = t.info
     if not info or info.get('quoteType') not in ('EQUITY', 'ETF', None):
         # quoteType 없어도 시도
@@ -743,7 +765,7 @@ def analyze_us_stock(ticker_symbol):
 
         # ── 요구수익률 r 계산 (rf + beta × ERP) ──────────────────────
         try:
-            tnx = yf.Ticker('^TNX')
+            tnx = yf.Ticker('^TNX', session=_YF_SESSION) if _YF_SESSION else yf.Ticker('^TNX')
             tnx_hist = tnx.history(period='5d')
             rf = float(tnx_hist['Close'].iloc[-1]) / 100 if not tnx_hist.empty else 0.044
         except:
