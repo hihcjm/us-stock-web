@@ -72,17 +72,22 @@ def parse_annual_history(data):
     balance  = data['balance']
     info     = data['info']
 
-    # ── 연도 라벨 수집 (income_stmt 기준) ──
+    # ── 연도 라벨 수집 (income_stmt 기준, 오래된 연도→최신 순 정렬) ──
     years = []
     col_dates = []
     if income is not None and not income.empty:
+        pairs = []
         for col in income.columns:
             try:
                 yr = pd.Timestamp(col).year
-                years.append(f"FY{yr}")
-                col_dates.append(col)
+                pairs.append((yr, col))
             except:
                 pass
+        # 오름차순 (FY2022 → FY2023 → ... → FY2025)
+        pairs.sort(key=lambda x: x[0])
+        for yr, col in pairs:
+            years.append(f"FY{yr}")
+            col_dates.append(col)
 
     if not years:
         return None
@@ -128,16 +133,19 @@ def parse_annual_history(data):
             fcf.append(None)
 
     # ── 재무상태표 ──
-    equity = [fmt_b(v) for v in get_row_first(balance,
-                'Stockholders Equity', 'Common Stock Equity')]
-    shares_bs = get_row_first(balance, 'Ordinary Shares Number')   # 십억주 단위
+    # equity_raw: 원달러(e.g. 7.37e10), shares_bs: 주 수(e.g. 1.47e10)
+    # BPS($/주) = equity(원달러) / shares(주수)
+    equity_raw = get_row_first(balance,
+                'Stockholders Equity', 'Common Stock Equity')
+    equity = [fmt_b(v) for v in equity_raw]   # 테이블 표시용 B달러
+    shares_bs = get_row_first(balance, 'Ordinary Shares Number')
     bps = []
     for i in range(len(years)):
-        eq = equity[i]
-        sh = safe_float(shares_bs[i]) if shares_bs[i] is not None else None
-        # equity는 B달러, shares는 십억주 단위
-        if eq is not None and sh and sh > 0:
-            bps.append(round(eq / sh, 2))   # 달러/주
+        eq_orig = safe_float(equity_raw[i]) if i < len(equity_raw) else None
+        sh = safe_float(shares_bs[i]) if i < len(shares_bs) and shares_bs[i] is not None else None
+        # equity는 원달러, shares는 주 수 → BPS = $/주
+        if eq_orig is not None and sh and sh > 0:
+            bps.append(round(eq_orig / sh, 2))   # 달러/주
         else:
             bps.append(None)
 
