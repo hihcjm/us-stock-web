@@ -594,8 +594,8 @@ def calc_us_valuations(hist_annual, estimates, r):
       1. EPS/r   : 내재가치 = EPS / r
       2. RIM     : 내재가치 = BPS × (ROE / r)
                    ROE는 yfinance 소수 (e.g. 1.41 = 141%) → 그대로 사용
-      3. Graham  : 내재가치 = EPS × (8.5 + 2×g) × (1 - r)
-                   g = 전체 연도(hist+fwd) ROE 평균 (소수, 0~30% 클램프)
+      3. Graham  : 내재가치 = EPS × (8.5 + ROE평균%) × (1 - r)
+                   ROE평균 = trailing ROE (소수, 0~30% 클램프)
     r: 요구수익률 소수 (e.g. 0.13)
     """
     rows  = hist_annual['rows']
@@ -636,11 +636,11 @@ def calc_us_valuations(hist_annual, estimates, r):
             if price and price > 0:
                 gap_rim = round((val_rim - price) / price * 100, 1)
 
-        # 3. Graham: EPS × (8.5 + 2×g) × (1 - r)
-        # g는 소수이므로 × 100 해서 % 정수로 변환 후 공식 적용
+        # 3. Graham: EPS × (8.5 + ROE평균%) × (1 - r)
+        # graham_g는 소수(e.g. 0.30), ×100 해서 % 정수로 사용
         val_graham = None; gap_graham = None
         if eps and eps > 0 and graham_g is not None and r and r > 0:
-            val_graham = round(eps * (8.5 + 2 * graham_g * 100) * (1 - r), 2)
+            val_graham = round(eps * (8.5 + graham_g * 100) * (1 - r), 2)
             if price and price > 0:
                 gap_graham = round((val_graham - price) / price * 100, 1)
 
