@@ -882,29 +882,61 @@ def calc_rolling_dcf(hist_annual, estimates, life_cycle: int = 2):
         ebit_latest = op_latest  if op_latest is not None else rev_latest * 0.10
         ebit_margin = ebit_latest / rev_latest if rev_latest else 0.10
 
-        # D&A = OpCF - NetIncome (fallback: capex proxy)
+        # ── D&A 추정 ───────────────────────────────────────────────
+        # yfinance cashflow에서 직접 조회 (Depreciation & Amortization)
         net_vals = get_all_valid('Net Income')
         net_latest = net_vals[0] if net_vals else None
-        if opcf_latest is not None and net_latest is not None:
-            da_latest = max(opcf_latest - net_latest, 0.0)
-            if da_latest < capex_latest * 0.3:
-                da_latest = capex_latest * 0.7   # sanity floor
-        else:
-            da_latest = capex_latest * 0.7
 
-        # Change in Working Capital (best effort)
+        da_latest = None
+        try:
+            cf_stmt = est.get('_raw_cashflow')
+            if cf_stmt is not None and not cf_stmt.empty:
+                for da_key in ('Depreciation And Amortization',
+                               'Reconciled Depreciation',
+                               'Depreciation Amortization Depletion'):
+                    if da_key in cf_stmt.index:
+                        v = safe_float(cf_stmt.loc[da_key].iloc[0])
+                        if v and v > 0:
+                            da_latest = fmt_b(v)
+                            break
+        except Exception:
+            pass
+
+        # Fallback: OpCF - NetIncome (간접법 CF 역산)
+        if da_latest is None or da_latest <= 0:
+            if opcf_latest is not None and net_latest is not None:
+                da_latest = max(opcf_latest - net_latest, 0.0)
+                if da_latest < capex_latest * 0.3:
+                    da_latest = capex_latest * 0.7   # sanity floor
+            else:
+                da_latest = capex_latest * 0.7
+        da_latest = max(da_latest or 0.0, rev_latest * 0.01)  # 최소 매출 1%
+
+        # ── Change in Working Capital ───────────────────────────────
         change_wc = 0.0
-        if opcf_latest is not None and net_latest is not None:
-            # rough: OpCF - NetIncome - DA ≈ ΔWC (negative = cash outflow absorbed)
+        try:
+            cf_stmt = est.get('_raw_cashflow')
+            if cf_stmt is not None and not cf_stmt.empty:
+                for wc_key in ('Change In Working Capital',
+                               'Changes In Working Capital',
+                               'Change In Other Working Capital'):
+                    if wc_key in cf_stmt.index:
+                        v = safe_float(cf_stmt.loc[wc_key].iloc[0])
+                        if v is not None:
+                            change_wc = fmt_b(v)
+                            change_wc = max(-rev_latest * 0.1,
+                                            min(change_wc, rev_latest * 0.1))
+                            break
+        except Exception:
+            pass
+        if change_wc == 0.0 and opcf_latest is not None and net_latest is not None:
             approx_wc = opcf_latest - (net_latest or 0) - da_latest
             change_wc = max(-rev_latest * 0.1, min(approx_wc, rev_latest * 0.1))
 
         # ── 세율 추정 ──────────────────────────────────────────────
-        # 세전이익 기준 실효세율; 없으면 US 법정세율 21%
-        tax_rate = 0.21
+        tax_rate = 0.21   # US 법정 기본
         try:
-            income_stmt = hist_annual.get('_income_stmt')
-            # yfinance income_stmt에서 Tax Provision / Pretax Income
+            income_stmt = est.get('_raw_income')
             if income_stmt is not None and not income_stmt.empty:
                 for taxkey in ('Tax Provision', 'Income Tax Expense'):
                     if taxkey in income_stmt.index:
@@ -913,15 +945,48 @@ def calc_rolling_dcf(hist_annual, estimates, life_cycle: int = 2):
                             if prekey in income_stmt.index:
                                 pretax = safe_float(income_stmt.loc[prekey].iloc[0])
                                 if pretax and pretax > 0 and tax_prov and tax_prov > 0:
-                                    tax_rate = min(tax_prov / pretax, 0.40)
+                                    tax_rate = max(0.05, min(tax_prov / pretax, 0.40))
                                 break
                         break
-        except:
+        except Exception:
             pass
 
-        # ── Balance Sheet 데이터 ────────────────────────────────────
+        # ── Balance Sheet: 현금 / 부채 ─────────────────────────────
+        # 1순위: yfinance info (totalCash, totalDebt)
+        # 2순위: balance_sheet DataFrame 직접 조회
         cash_b = fmt_b(safe_float(raw_info.get('totalCash'))) or 0.0
         debt_b = fmt_b(safe_float(raw_info.get('totalDebt'))) or 0.0
+
+        try:
+            bs_stmt = est.get('_raw_balance')
+            if bs_stmt is not None and not bs_stmt.empty:
+                # 현금이 없으면 BS에서 조회
+                if cash_b <= 0:
+                    for ck in ('Cash And Cash Equivalents',
+                               'Cash Cash Equivalents And Short Term Investments',
+                               'Cash And Short Term Investments'):
+                        if ck in bs_stmt.index:
+                            v = fmt_b(safe_float(bs_stmt.loc[ck].iloc[0]))
+                            if v and v > 0:
+                                cash_b = v
+                                break
+                # 부채가 없으면 BS에서 조회
+                if debt_b <= 0:
+                    for dk in ('Total Debt', 'Long Term Debt And Capital Lease Obligation',
+                               'Long Term Debt'):
+                        if dk in bs_stmt.index:
+                            v = fmt_b(safe_float(bs_stmt.loc[dk].iloc[0]))
+                            if v and v > 0:
+                                debt_b = v
+                                break
+        except Exception:
+            pass
+
+        # cash fallback: 시총의 5% (현금 최소 추정)
+        if cash_b <= 0:
+            mktcap_b = safe_float(est.get('market_cap')) or 0.0
+            cash_b = mktcap_b * 0.05 if mktcap_b > 0 else 0.0
+
         # minority interest: US firms 대부분 0
         minority_b = 0.0
 
@@ -1049,8 +1114,11 @@ def analyze_us_stock(ticker_symbol, life_cycle: int = 2):
             return {"error": "Failed to parse financial history."}
 
         est     = get_estimates(raw)
-        # cash/debt raw info를 est에 주입 (DCF 브리지용)
-        est['_raw_info'] = raw['info']
+        # raw 재무제표 데이터를 est에 주입 (DCF 엔진에서 D&A, ΔWC, 세율, 현금/부채 정밀 조회용)
+        est['_raw_info']     = raw['info']
+        est['_raw_income']   = raw.get('income')
+        est['_raw_cashflow'] = raw.get('cashflow')
+        est['_raw_balance']  = raw.get('balance')
         dcf     = calc_dcf(hist, est)
         band    = calc_band(hist, est)
         fin_tbl = build_fin_table(hist)

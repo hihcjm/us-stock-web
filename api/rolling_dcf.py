@@ -90,6 +90,7 @@ class DamodaranDCF:
     _GUARD_REINV_MIN  = -0.5
     _GUARD_REINV_MAX  =  0.95
     _GUARD_ROIC_FLOOR =  0.001
+    _GUARD_ROIC_CAP   =  0.80   # ROIC cap 80% — allows light-asset / platform firms
 
     def __init__(
         self,
@@ -157,16 +158,25 @@ class DamodaranDCF:
     def _base_roic(self) -> float:
         """
         ROIC = NOPAT / Invested Capital
-        IC = max(D&A × 5, Revenue × 0.5)
-        Same logic as pvgo_web, calibrated for US firms.
+
+        IC estimation:
+          1. D&A-based : D&A × 7  — proxy for gross PP&E + intangibles (7yr life)
+          2. Revenue-based: revenue × 0.3  — asset-light / platform firms (3.3x turnover)
+
+        max() selects the larger IC → more conservative (lower) ROIC.
+
+        ROIC cap raised to 80% (from 40%):
+          - Top-tier US tech/platform firms routinely show 50–80% ROIC.
+          - The old 40% cap artificially suppressed g, causing systematic
+            under-valuation of light-asset companies (Apple, NVIDIA, etc.).
         """
         nopat        = self._nopat()
         da           = max(self.fin.depr_amort, 1e-9)
-        ic_da_based  = da * 5.0
-        ic_rev_based = self.fin.revenue * 0.5
+        ic_da_based  = da * 7.0              # D&A × 7-year life
+        ic_rev_based = self.fin.revenue * 0.3  # Revenue-based (asset-light floor)
         ic           = max(ic_da_based, ic_rev_based, 1e-9)
         roic         = nopat / ic
-        return min(max(roic, self._GUARD_ROIC_FLOOR), 0.40)
+        return min(max(roic, self._GUARD_ROIC_FLOOR), self._GUARD_ROIC_CAP)
 
     @staticmethod
     def _pv(wacc: float, t: int) -> float:
